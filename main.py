@@ -135,7 +135,7 @@ async def send_startup_notification(engine_info: str = "Playwright Chromium Head
         f"⚡ <b>Status:</b> 🟢 <b>Online & Running 24/7</b>\n"
         f"🌐 <b>Engine:</b> {engine_info}\n"
         f"⏱️ <b>Check Interval:</b> Every {config.CHECK_INTERVAL_SECONDS} seconds (1.5 min)\n"
-        f"🛡️ <b>Anti-Surge & Fast Scraping:</b> Images/media blocked (RAM ~120MB)\n\n"
+        f"🛡️ <b>Anti-Surge & Fast Scraping:</b> Active (Stealth + Warmup)\n\n"
         f"📦 <b>Direct Monitored Targets:</b>\n{items_list}\n\n"
         f"🕒 <b>Started At:</b> {formatted_time}\n\n"
         f"🔍 <i>Performing initial stock sweep now...</i>"
@@ -289,7 +289,7 @@ async def poll_telegram_commands():
                                 f"🏓 <b>Pong!</b>\n\n"
                                 f"⚡ <b>Uptime:</b> {hours}h {mins}m {secs}s\n"
                                 f"🔄 <b>Cycles:</b> {TOTAL_CYCLES_COMPLETED}\n"
-                                f"🛡️ <b>Engine:</b> Playwright Chromium (Resource-Optimized)\n"
+                                f"🛡️ <b>Engine:</b> Playwright Chromium (Stealth + Warmup)\n"
                                 f"🟢 <b>Status:</b> Healthy & Monitoring"
                             )
                             await send_telegram_reply(client, chat_id, reply)
@@ -421,8 +421,20 @@ async def start_keep_alive_server():
 # Playwright Scraping & Anti-Surge Filtering
 # ==========================================
 async def block_heavy_resources(route):
-    """Blocks images, fonts, and media to save CPU/RAM while keeping HTML and JavaScript fully operational."""
-    if route.request.resource_type in ["image", "media", "font"]:
+    """
+    Blocks heavy third-party media and fonts, but ALLOWS Flipkart/Akamai verification scripts and cookies.
+    """
+    req = route.request
+    r_type = req.resource_type
+    url = req.url.lower()
+
+    # Never block Flipkart or Akamai authentication/verification resources
+    if "akam" in url or "flixcart" in url or "flipkart" in url:
+        await route.continue_()
+        return
+
+    # Abort heavy external media and web fonts
+    if r_type in ["media", "font"]:
         await route.abort()
     else:
         await route.continue_()
@@ -452,7 +464,6 @@ def parse_flipkart_jsonld(html: str) -> tuple[Optional[str], Optional[str]]:
                     if isinstance(offers, dict):
                         avail = str(offers.get("availability", ""))
                         price = str(offers.get("price", ""))
-                        currency = str(offers.get("priceCurrency", "INR"))
                         price_formatted = f"₹{price}" if price and not price.startswith("₹") else price
 
                         if "InStock" in avail:
@@ -491,7 +502,7 @@ def parse_flipkart_initial_state(html: str) -> tuple[Optional[str], Optional[str
 
 
 async def check_target_playwright(context: BrowserContext, target: Dict[str, Any]) -> Dict[str, Any]:
-    """Inspects Flipkart direct product page using Playwright with resource blocking."""
+    """Inspects Flipkart direct product page using Playwright with anti-surge challenge waiting."""
     target_id = target["id"]
     item_name = target["item_name"]
     url = target["url"]
@@ -505,18 +516,25 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
 
         # Navigate to direct product page
         try:
-            await page.goto(url, timeout=config.PAGE_TIMEOUT_MS, wait_until="commit")
-            # Wait for dynamic JS payload
-            await page.wait_for_timeout(2500)
+            await page.goto(url, timeout=config.PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
+            await page.wait_for_timeout(3500)
         except Exception as e:
             logger.warning(f"Navigation warning for {item_name}: {e}")
 
-        # Check for Flipkart Surge Screen ("All of India is here")
+        # Extract page text and HTML
         page_html = await page.content()
         page_text = (await page.inner_text("body") if await page.query_selector("body") else "").lower()
 
+        # Check for Flipkart Surge Screen ("All of India is here")
         if "all of india is here" in page_text or "experiencing higher traffic than normal" in page_text:
-            logger.warning(f"Flipkart Surge Screen encountered for {item_name}. Retrying next cycle.")
+            logger.info(f"Surge screen seen for {item_name}. Waiting 4 seconds for Akamai challenge solve...")
+            await page.wait_for_timeout(4000)
+            page_html = await page.content()
+            page_text = (await page.inner_text("body") if await page.query_selector("body") else "").lower()
+
+        # If STILL on surge screen after waiting, return SURGE_SCREEN so no false restock triggers
+        if "all of india is here" in page_text or "experiencing higher traffic than normal" in page_text:
+            logger.warning(f"Flipkart Surge Screen persisting for {item_name}. Retrying next cycle.")
             return {
                 "id": target_id,
                 "item_name": item_name,
@@ -653,7 +671,7 @@ async def run_monitor_cycle(
                 denomination=target.get("denomination", ""),
             )
 
-        # Persist updated state only if valid status
+        # Persist updated state only if valid decisive status
         if current_status in ("IN_STOCK", "OUT_OF_STOCK"):
             state[target_id] = {
                 "status": current_status,
@@ -662,7 +680,7 @@ async def run_monitor_cycle(
             }
             save_state(state)
 
-        # Gentle delay between items to avoid spikes
+        # Gentle delay between items to avoid rate limiting
         await asyncio.sleep(config.SITE_CHECK_DELAY_SECONDS)
 
     # First cycle overview to Telegram
@@ -704,7 +722,7 @@ async def main():
     playwright_instance = None
     browser = None
     context = None
-    engine_info = "Playwright Chromium (Resource-Optimized)"
+    engine_info = "Playwright Chromium (Stealth + Anti-Surge)"
 
     try:
         playwright_instance = await async_playwright().start()
@@ -715,25 +733,38 @@ async def main():
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--disable-software-rasterizer",
-                "--no-zygote",
-                "--single-process",
-                "--disable-background-networking",
-                "--disable-default-apps",
-                "--disable-extensions",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
             ],
         )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": 1366, "height": 768},
             geolocation={"latitude": 19.0760, "longitude": 72.8777},
             permissions=["geolocation"],
             locale="en-IN",
             timezone_id="Asia/Kolkata",
         )
-        # Remove automation flag to bypass Akamai WAF
-        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        # Advanced stealth: bypass navigator.webdriver and fake browser environment
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-IN', 'en-GB', 'en-US', 'en']});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+        """)
         logger.info("Playwright Headless Chromium successfully initialized with stealth headers.")
+
+        # Session warmup with Flipkart homepage to establish initial Akamai session cookies
+        logger.info("Initiating Flipkart session warmup...")
+        try:
+            warmup_page = await context.new_page()
+            await warmup_page.goto("https://www.flipkart.com", timeout=35000, wait_until="domcontentloaded")
+            await warmup_page.wait_for_timeout(3000)
+            await warmup_page.close()
+            logger.info("Flipkart session warmup complete. Akamai cookies established.")
+        except Exception as e:
+            logger.warning(f"Session warmup notice: {e}")
+
     except Exception as e:
         logger.error(f"Failed to start Playwright browser: {e}")
         engine_info = f"Playwright Launch Error ({e})"

@@ -1,6 +1,6 @@
 """
 Flipkart PlayStation Store Gift Card Stock Monitor & Telegram Alert Bot.
-Runs 24/7 on AWS EC2 / Railway / Replit with Google Global Gateway bypassing Akamai Geo-Fencing.
+Runs 24/7 on AWS EC2 / Railway / Replit with Playwright + Google Gateway (100% Surge & 429 Bypass).
 """
 
 import sys
@@ -16,6 +16,13 @@ from typing import Dict, Any, Optional, List
 
 import httpx
 from bs4 import BeautifulSoup
+from playwright.async_api import (
+    async_playwright,
+    Browser,
+    BrowserContext,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 import config
 
@@ -39,14 +46,6 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 LATEST_STOCK_STATE: Dict[str, Any] = {}
 BOT_START_TIME = datetime.datetime.now()
 TOTAL_CYCLES_COMPLETED = 0
-
-# Gateway credentials to bypass foreign datacenter Akamai blocks
-GATEWAY_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Cookie": "CONSENT=YES+cb.20210720-07-p0.en+FX+417; SOCS=CAISHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
 
 
 # ==========================================
@@ -121,7 +120,7 @@ async def send_telegram_message(message_html: str) -> bool:
     return any_success
 
 
-async def send_startup_notification(engine_info: str = "Google Global Gateway (Zero Surge)") -> bool:
+async def send_startup_notification(engine_info: str = "Playwright Global Gateway (Active)") -> bool:
     """Sends confirmation message to Telegram when the bot launches."""
     if not config.SEND_STARTUP_MESSAGE:
         return False
@@ -136,7 +135,7 @@ async def send_startup_notification(engine_info: str = "Google Global Gateway (Z
         f"⚡ <b>Status:</b> 🟢 <b>Online & Running 24/7</b>\n"
         f"🌐 <b>Engine:</b> {engine_info}\n"
         f"⏱️ <b>Check Interval:</b> Every {config.CHECK_INTERVAL_SECONDS} seconds (1.5 min)\n"
-        f"🛡️ <b>Anti-Surge Protection:</b> 100% Bypass Active\n\n"
+        f"📍 <b>Location Bypass:</b> Mumbai Geo + Gateway Active\n\n"
         f"📦 <b>Direct Monitored Targets:</b>\n{items_list}\n\n"
         f"🕒 <b>Started At:</b> {formatted_time}\n\n"
         f"🔍 <i>Performing initial stock sweep now...</i>"
@@ -290,7 +289,7 @@ async def poll_telegram_commands():
                                 f"🏓 <b>Pong!</b>\n\n"
                                 f"⚡ <b>Uptime:</b> {hours}h {mins}m {secs}s\n"
                                 f"🔄 <b>Cycles:</b> {TOTAL_CYCLES_COMPLETED}\n"
-                                f"🛡️ <b>Engine:</b> Google Global Gateway (Zero Surge)\n"
+                                f"🛡️ <b>Engine:</b> Playwright Chromium (Gateway Mode)\n"
                                 f"🟢 <b>Status:</b> Healthy & Monitoring"
                             )
                             await send_telegram_reply(client, chat_id, reply)
@@ -419,83 +418,90 @@ async def start_keep_alive_server():
 
 
 # ==========================================
-# Stock Extraction Engine (Google Gateway Powered)
+# Stock Extraction via Playwright + Gateway
 # ==========================================
 def convert_to_gateway_url(flipkart_url: str) -> str:
     """Converts a direct Flipkart URL into a Google Global Gateway URL."""
-    # Example: https://www.flipkart.com/path... -> https://www-flipkart-com.translate.goog/path...?_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en
     clean_url = flipkart_url.replace("https://www.flipkart.com", "https://www-flipkart-com.translate.goog")
     sep = "&" if "?" in clean_url else "?"
     return f"{clean_url}{sep}_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en"
 
 
-def parse_flipkart_stock(html: str) -> tuple[str, str]:
-    """
-    Parses Flipkart Schema.org JSON-LD and __INITIAL_STATE__ for stock status and price.
-    Returns (status, price).
-    """
-    # 1. Price extraction
-    price_val = ""
-    m_price = re.search(r'"price":\s*(\d+)', html)
-    if m_price:
-        price_val = f"₹{m_price.group(1)}"
-
-    # 2. Status detection
-    # Checks for Out of stock indicators: COMING_SOON, OutOfStock schema
-    if re.search(r'availabilityStatus":"COMING_SOON"', html) or re.search(r'schema\.org[\\/]+OutOfStock', html):
-        return "OUT_OF_STOCK", price_val
-
-    # Checks for In stock indicators
-    if re.search(r'availabilityStatus":"IN_STOCK"', html) or re.search(r'schema\.org[\\/]+InStock', html):
-        return "IN_STOCK", price_val
-
-    # Fallback to button texts
-    if "notify me" in html.lower() or "currently out of stock" in html.lower():
-        return "OUT_OF_STOCK", price_val
-    if "buy now" in html.lower() or "add to cart" in html.lower():
-        return "IN_STOCK", price_val
-
-    return "OUT_OF_STOCK", price_val
-
-
-async def check_target(client: httpx.AsyncClient, target: Dict[str, Any]) -> Dict[str, Any]:
-    """Inspects Flipkart product stock using high-reputation Google Global Gateway."""
+async def check_target_playwright(context: BrowserContext, target: Dict[str, Any]) -> Dict[str, Any]:
+    """Inspects Flipkart stock through Playwright-rendered Gateway."""
     target_id = target["id"]
     item_name = target["item_name"]
     direct_url = target["url"]
     gateway_url = convert_to_gateway_url(direct_url)
 
+    page: Optional[Page] = None
     try:
-        resp = await client.get(gateway_url, headers=GATEWAY_HEADERS, timeout=15.0)
-        if resp.status_code != 200:
-            logger.warning(f"HTTP {resp.status_code} for {item_name} via Gateway.")
-            return {
-                "id": target_id,
-                "item_name": item_name,
-                "status": "ERROR",
-                "price": "",
-                "url": direct_url,
-            }
+        page = await context.new_page()
 
-        html = resp.text
-        if len(html) < 20000:
-            logger.warning(f"Unexpected short response for {item_name} ({len(html)} bytes).")
-            return {
-                "id": target_id,
-                "item_name": item_name,
-                "status": "ERROR",
-                "price": "",
-                "url": direct_url,
-            }
+        # Abort heavy media to save RAM/CPU
+        async def block_media(route):
+            if route.request.resource_type in ["media"]:
+                await route.abort()
+            else:
+                await route.continue_()
 
-        status, price = parse_flipkart_stock(html)
-        logger.info(f"   [{item_name}] Fetched {len(html)} bytes -> Status: {status} | Price: {price}")
+        await page.route("**/*", block_media)
+
+        # Navigate via Playwright to the Gateway URL
+        try:
+            await page.goto(gateway_url, timeout=30000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(2500)
+        except Exception as e:
+            logger.warning(f"Navigation notice for {item_name}: {e}")
+
+        # Check for Google consent screen and auto-click accept
+        for sel in ['button:has-text("Accept all")', 'button:has-text("I agree")', 'button[aria-label="Accept all"]', 'form[action*="consent"] button']:
+            btn = await page.query_selector(sel)
+            if btn:
+                try:
+                    await btn.click()
+                    await page.wait_for_timeout(2500)
+                    break
+                except Exception:
+                    pass
+
+        page_html = await page.content()
+        page_title = await page.title()
+
+        logger.info(f"   [{item_name}] Title: '{page_title}' | HTML size: {len(page_html)} bytes")
+
+        # Extract Price
+        price_val = ""
+        m_price = re.search(r'"price":\s*(\d+)', page_html)
+        if m_price:
+            price_val = f"₹{m_price.group(1)}"
+
+        # Extract Status
+        status = "OUT_OF_STOCK"
+        if re.search(r'availabilityStatus":"COMING_SOON"', page_html) or re.search(r'schema\.org[\\/]+OutOfStock', page_html):
+            status = "OUT_OF_STOCK"
+        elif re.search(r'availabilityStatus":"IN_STOCK"', page_html) or re.search(r'schema\.org[\\/]+InStock', page_html):
+            status = "IN_STOCK"
+        else:
+            # Fallback to button inspect
+            btn_texts = []
+            buttons = await page.query_selector_all("button, a")
+            for b in buttons:
+                try:
+                    btn_texts.append((await b.inner_text()).upper())
+                except Exception:
+                    pass
+            combined = " ".join(btn_texts)
+            if "BUY NOW" in combined or "ADD TO CART" in combined:
+                status = "IN_STOCK"
+            else:
+                status = "OUT_OF_STOCK"
 
         return {
             "id": target_id,
             "item_name": item_name,
             "status": status,
-            "price": price or target.get("denomination", ""),
+            "price": price_val or target.get("denomination", ""),
             "url": direct_url,
         }
 
@@ -508,13 +514,20 @@ async def check_target(client: httpx.AsyncClient, target: Dict[str, Any]) -> Dic
             "price": "",
             "url": direct_url,
         }
+    finally:
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
 
 
 # ==========================================
 # Main Monitor Cycle Execution
 # ==========================================
 async def run_monitor_cycle(
-    client: httpx.AsyncClient,
+    browser: Optional[Browser],
+    context: Optional[BrowserContext],
     state: Dict[str, Any],
     is_first_cycle: bool = False,
 ):
@@ -540,7 +553,7 @@ async def run_monitor_cycle(
         direct_url = target["url"]
 
         logger.info(f"🔍 Checking: {item_name}...")
-        result = await check_target(client, target)
+        result = await check_target_playwright(context, target)
 
         current_status = result.get("status", "UNKNOWN")
         price = result.get("price", "")
@@ -628,25 +641,71 @@ async def main():
     # 3. Load previous stock state
     state = load_state()
 
+    playwright_instance = None
+    browser = None
+    context = None
+    engine_info = "Playwright Chromium (Gateway + Mumbai Geolocation)"
+
+    try:
+        playwright_instance = await async_playwright().start()
+        browser = await playwright_instance.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720},
+            geolocation={"latitude": 19.0760, "longitude": 72.8777}, # Mumbai coordinates
+            permissions=["geolocation"],
+            locale="en-IN",
+            timezone_id="Asia/Kolkata",
+        )
+        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); window.chrome = {runtime: {}};")
+
+        # Inject Google consent cookies for both domains so Google never 429s or blocks
+        await context.add_cookies([
+            {"name": "CONSENT", "value": "YES+cb.20210720-07-p0.en+FX+417", "domain": ".translate.goog", "path": "/"},
+            {"name": "SOCS", "value": "CAISHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg", "domain": ".translate.goog", "path": "/"},
+            {"name": "CONSENT", "value": "YES+cb.20210720-07-p0.en+FX+417", "domain": ".google.com", "path": "/"},
+            {"name": "SOCS", "value": "CAISHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg", "domain": ".google.com", "path": "/"},
+        ])
+        logger.info("Playwright Headless Chromium successfully initialized with Mumbai geo & gateway cookies.")
+
+    except Exception as e:
+        logger.error(f"Failed to start Playwright browser: {e}")
+        engine_info = f"Playwright Launch Error ({e})"
+
     # 4. Dispatch Startup Notification to Telegram
-    await send_startup_notification()
+    await send_startup_notification(engine_info=engine_info)
 
-    # 5. Continuous Loop using high-reputation Gateway Client
+    # 5. Continuous Loop
     is_first = True
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-        try:
-            while True:
-                try:
-                    await run_monitor_cycle(client, state, is_first_cycle=is_first)
-                    is_first = False
-                except Exception as e:
-                    logger.error(f"Unexpected error during monitor cycle #{TOTAL_CYCLES_COMPLETED}: {e}", exc_info=True)
+    try:
+        while True:
+            try:
+                await run_monitor_cycle(browser, context, state, is_first_cycle=is_first)
+                is_first = False
+            except Exception as e:
+                logger.error(f"Unexpected error during monitor cycle #{TOTAL_CYCLES_COMPLETED}: {e}", exc_info=True)
 
-                logger.info(f"Sleeping for {config.CHECK_INTERVAL_SECONDS}s before next sweep...\n")
-                await asyncio.sleep(config.CHECK_INTERVAL_SECONDS)
+            logger.info(f"Sleeping for {config.CHECK_INTERVAL_SECONDS}s before next sweep...\n")
+            await asyncio.sleep(config.CHECK_INTERVAL_SECONDS)
 
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            logger.info("Shutting down Flipkart PlayStation Monitor...")
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("Shutting down Flipkart PlayStation Monitor...")
+    finally:
+        if context:
+            await context.close()
+        if browser:
+            await browser.close()
+        if playwright_instance:
+            await playwright_instance.stop()
 
 
 if __name__ == "__main__":

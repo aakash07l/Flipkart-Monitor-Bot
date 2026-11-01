@@ -24,3 +24,4 @@ EXPOSE 8080
 
 # Command to run bot
 CMD ["python", "main.py"]
+

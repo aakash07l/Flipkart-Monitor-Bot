@@ -22,8 +22,8 @@ pip install --upgrade pip
 pip install -r requirements.txt
 
 echo "🌐 Installing Playwright Chromium and system dependencies..."
-python3 -m playwright install chromium
-sudo python3 -m playwright install-deps chromium
+./venv/bin/playwright install chromium
+sudo ./venv/bin/playwright install-deps chromium
 
 echo "⚙️ Configuring systemd background service..."
 sudo cp flipkart-bot.service /etc/systemd/system/flipkart-bot.service

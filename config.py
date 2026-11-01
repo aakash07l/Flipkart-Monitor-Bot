@@ -1,6 +1,6 @@
 """
 Configuration for Flipkart PlayStation Store Gift Card Stock Monitor.
-Monitors PSN vouchers (₹1000, ₹2000, ₹3000, ₹4000, ₹5000) with ultra-fast restock detection.
+Monitors exact PSN vouchers (₹1000, ₹2000, ₹3000, ₹4000, ₹5000) with zero false alarms.
 """
 
 import os
@@ -61,65 +61,48 @@ KEEP_ALIVE_PORT = int(os.getenv("PORT", "8080"))
 BLOCK_MEDIA_RESOURCES = True
 
 # ==========================================
-# 3. Monitored Flipkart PlayStation Gift Cards (1k, 2k, 3k, 4k, 5k)
+# 3. Direct Monitored Flipkart PlayStation Gift Cards (1k, 2k, 3k, 4k, 5k)
+# Direct product URLs only - avoids search feed false positives (games, accessories)
 # ==========================================
 TARGET_SITES = [
     {
         "id": "flipkart_psn_1000",
         "platform": "Flipkart",
-        "item_name": "PlayStation Store ₹1,000 Gift Card (Digital Voucher)",
-        "url": "https://www.flipkart.com/playstation-rs-1000-inr-gift-card/p/itm22718b5b7e19d",
+        "item_name": "PlayStation Store ₹1,000 Gift Card",
+        "url": "https://www.flipkart.com/playstation-rs-1000-inr-gift-card/p/itm3d59225ae5e13",
         "denomination": "₹1,000",
-        "is_search": False,
         "enabled": True,
     },
     {
         "id": "flipkart_psn_2000",
         "platform": "Flipkart",
-        "item_name": "PlayStation Store ₹2,000 Gift Card (Digital Voucher)",
-        "url": "https://www.flipkart.com/ps-wallet-top-up-2000-new-for-ps4-ps5/p/itm5359a5de62acb",
+        "item_name": "PlayStation Store ₹2,000 Gift Card",
+        "url": "https://www.flipkart.com/playstation-rs-2000-inr-gift-card/p/itmd41e56cc4ca04",
         "denomination": "₹2,000",
-        "is_search": False,
         "enabled": True,
     },
     {
         "id": "flipkart_psn_3000",
         "platform": "Flipkart",
-        "item_name": "PlayStation Store ₹3,000 Gift Card (Digital Voucher)",
+        "item_name": "PlayStation Store ₹3,000 Gift Card",
         "url": "https://www.flipkart.com/sony-interactive-entertainment-europe-rs-3000-playstation-store-gift-card-digital-voucher-delivery-email/p/itma3cec289dd512?pid=DGVHGEX6BGYDMJGZ",
         "denomination": "₹3,000",
-        "is_search": False,
         "enabled": True,
     },
     {
         "id": "flipkart_psn_4000",
         "platform": "Flipkart",
-        "item_name": "PlayStation Store ₹4,000 Gift Card (Digital Voucher)",
-        "url": "https://www.flipkart.com/search?q=sony+interactive+entertainment+playstation+store+gift+card+4000",
+        "item_name": "PlayStation Store ₹4,000 Gift Card",
+        "url": "https://www.flipkart.com/playstation-rs-4000-store-gift-card/p/itm0ceacc74a0363",
         "denomination": "₹4,000",
-        "is_search": True,
-        "target_denomination_filter": 4000,
         "enabled": True,
     },
     {
         "id": "flipkart_psn_5000",
         "platform": "Flipkart",
-        "item_name": "PlayStation Store ₹5,000 Gift Card (Digital Voucher)",
-        "url": "https://www.flipkart.com/search?q=sony+interactive+entertainment+playstation+store+gift+card+5000",
+        "item_name": "PlayStation Store ₹5,000 Gift Card",
+        "url": "https://www.flipkart.com/sony-interactive-entertainment-europe-rs-5000-playstation-store-gift-card-digital-voucher-delivery-email/p/itmcf54504b6dee2",
         "denomination": "₹5,000",
-        "is_search": True,
-        "target_denomination_filter": 5000,
-        "enabled": True,
-    },
-    {
-        "id": "flipkart_psn_catchall",
-        "platform": "Flipkart",
-        "item_name": "PlayStation Store All Vouchers (Live Feed)",
-        "url": "https://www.flipkart.com/search?q=playstation+store+gift+card+digital+voucher",
-        "denomination": "All Denominations",
-        "is_search": True,
-        "target_denomination_filter": None,
         "enabled": True,
     },
 ]
-

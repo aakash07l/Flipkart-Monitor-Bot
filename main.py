@@ -136,7 +136,7 @@ async def send_startup_notification(engine_info: str = "Playwright Chromium Head
         f"🌐 <b>Engine:</b> {engine_info}\n"
         f"⏱️ <b>Check Interval:</b> Every {config.CHECK_INTERVAL_SECONDS} seconds (1.5 min)\n"
         f"🛡️ <b>Anti-Surge & Fast Scraping:</b> Images/media blocked (RAM ~120MB)\n\n"
-        f"📦 <b>Monitored Items:</b>\n{items_list}\n\n"
+        f"📦 <b>Direct Monitored Targets:</b>\n{items_list}\n\n"
         f"🕒 <b>Started At:</b> {formatted_time}\n\n"
         f"🔍 <i>Performing initial stock sweep now...</i>"
     )
@@ -217,10 +217,10 @@ async def send_telegram_alert(
         f"🚨 <b>RESTOCK ALERT: Flipkart PlayStation Card!</b> 🚨\n\n"
         f"🛒 <b>Platform:</b> {platform}\n"
         f"💳 <b>Item:</b> {item_name}\n"
-        f"💰 <b>Price / Value:</b> {price if price else (denomination if denomination else 'Check Listing')}\n"
+        f"💰 <b>Denomination / Price:</b> {price if price else (denomination if denomination else 'Check Listing')}\n"
         f"📦 <b>Status:</b> 🟢 <b>IN STOCK NOW!</b>\n"
         f"🕒 <b>Detected At:</b> {formatted_time}\n\n"
-        f"⚡ <b>Hurry! Codes sell out in 60-90 seconds!</b>\n"
+        f"⚡ <b>Hurry! Gift cards sell out quickly!</b>\n"
         f"🔗 <a href='{url}'><b>👉 CLICK HERE TO BUY ON FLIPKART 👈</b></a>\n"
     )
     logger.info(f"🚨 DISPATCHING RESTOCK ALERT FOR: {item_name}")
@@ -289,12 +289,12 @@ async def poll_telegram_commands():
                                 f"🏓 <b>Pong!</b>\n\n"
                                 f"⚡ <b>Uptime:</b> {hours}h {mins}m {secs}s\n"
                                 f"🔄 <b>Cycles:</b> {TOTAL_CYCLES_COMPLETED}\n"
-                                f"🛡️ <b>Engine:</b> Playwright Chromium (Resource Blocking Active)\n"
+                                f"🛡️ <b>Engine:</b> Playwright Chromium (Resource-Optimized)\n"
                                 f"🟢 <b>Status:</b> Healthy & Monitoring"
                             )
                             await send_telegram_reply(client, chat_id, reply)
 
-            except Exception as e:
+            except Exception:
                 await asyncio.sleep(5)
             await asyncio.sleep(1)
 
@@ -491,12 +491,10 @@ def parse_flipkart_initial_state(html: str) -> tuple[Optional[str], Optional[str
 
 
 async def check_target_playwright(context: BrowserContext, target: Dict[str, Any]) -> Dict[str, Any]:
-    """Inspects Flipkart product page or search feed using Playwright with resource blocking."""
+    """Inspects Flipkart direct product page using Playwright with resource blocking."""
     target_id = target["id"]
     item_name = target["item_name"]
     url = target["url"]
-    is_search = target.get("is_search", False)
-    denom_filter = target.get("target_denomination_filter")
 
     page: Optional[Page] = None
     try:
@@ -505,7 +503,7 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
         if config.BLOCK_MEDIA_RESOURCES:
             await page.route("**/*", block_heavy_resources)
 
-        # Navigate to page
+        # Navigate to direct product page
         try:
             await page.goto(url, timeout=config.PAGE_TIMEOUT_MS, wait_until="commit")
             # Wait for dynamic JS payload
@@ -527,94 +525,44 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
                 "url": url,
             }
 
-        # ----------------------------------------------------
-        # SCENARIO 1: Direct Product Details Page
-        # ----------------------------------------------------
-        if not is_search:
-            # 1. Primary: JSON-LD Structured Data
-            status, price = parse_flipkart_jsonld(page_html)
+        # 1. Primary: JSON-LD Structured Data
+        status, price = parse_flipkart_jsonld(page_html)
 
-            # 2. Secondary: __INITIAL_STATE__
-            if not status:
-                status, price = parse_flipkart_initial_state(page_html)
+        # 2. Secondary: __INITIAL_STATE__
+        if not status:
+            status, price = parse_flipkart_initial_state(page_html)
 
-            # 3. Tertiary: Button and text inspection
-            if not status:
-                # Check for buy button texts
-                has_buy_button = False
-                has_oos_button = False
+        # 3. Tertiary: Button and text inspection
+        if not status:
+            has_buy_button = False
+            has_oos_button = False
 
-                buttons = await page.query_selector_all("button, a")
-                for btn in buttons:
-                    try:
-                        btn_txt = (await btn.inner_text()).strip().upper()
-                        if "BUY NOW" in btn_txt or "ADD TO CART" in btn_txt:
-                            has_buy_button = True
-                            break
-                        if "NOTIFY ME" in btn_txt or "COMING SOON" in btn_txt or "OUT OF STOCK" in btn_txt:
-                            has_oos_button = True
-                    except Exception:
-                        pass
-
-                if has_buy_button:
-                    status = "IN_STOCK"
-                elif has_oos_button or "currently out of stock" in page_text or "coming soon" in page_text:
-                    status = "OUT_OF_STOCK"
-                else:
-                    status = "OUT_OF_STOCK"
-
-            return {
-                "id": target_id,
-                "item_name": item_name,
-                "status": status or "OUT_OF_STOCK",
-                "price": price or target.get("denomination", ""),
-                "url": url,
-            }
-
-        # ----------------------------------------------------
-        # SCENARIO 2: Search Page (Discovery for 4k, 5k or live restocks)
-        # ----------------------------------------------------
-        else:
-            soup = BeautifulSoup(page_html, "html.parser")
-            found_instock = False
-            found_price = ""
-            found_url = url
-            found_name = item_name
-
-            # Look through product links on the search results page
-            links = soup.find_all("a", href=True)
-            for a in links:
-                href = a["href"]
-                if "/p/" in href and ("playstation" in href.lower() or "sony" in href.lower() or "voucher" in href.lower()):
-                    card_text = a.get_text(separator=" ", strip=True).lower()
-                    parent = a.find_parent("div")
-                    parent_text = parent.get_text(separator=" ", strip=True).lower() if parent else card_text
-
-                    # Filter by denomination if specified
-                    if denom_filter and str(denom_filter) not in parent_text:
-                        continue
-
-                    # Check if card says coming soon or currently out of stock
-                    if "coming soon" in parent_text or "currently unavailable" in parent_text or "out of stock" in parent_text:
-                        continue
-
-                    # Look for pricing info
-                    price_match = re.search(r"₹\s*([0-9,]+)", parent_text)
-                    if price_match:
-                        found_price = f"₹{price_match.group(1)}"
-                        found_instock = True
-                        clean_href = href if href.startswith("http") else f"https://www.flipkart.com{href}"
-                        found_url = clean_href.split("?")[0]
-                        found_name = a.get("title") or item_name
+            buttons = await page.query_selector_all("button, a")
+            for btn in buttons:
+                try:
+                    btn_txt = (await btn.inner_text()).strip().upper()
+                    if "BUY NOW" in btn_txt or "ADD TO CART" in btn_txt:
+                        has_buy_button = True
                         break
+                    if "NOTIFY ME" in btn_txt or "COMING SOON" in btn_txt or "OUT OF STOCK" in btn_txt:
+                        has_oos_button = True
+                except Exception:
+                    pass
 
-            return {
-                "id": target_id,
-                "item_name": found_name,
-                "status": "IN_STOCK" if found_instock else "OUT_OF_STOCK",
-                "price": found_price or target.get("denomination", ""),
-                "url": found_url,
-            }
+            if has_buy_button:
+                status = "IN_STOCK"
+            elif has_oos_button or "currently out of stock" in page_text or "coming soon" in page_text:
+                status = "OUT_OF_STOCK"
+            else:
+                status = "OUT_OF_STOCK"
+
+        return {
+            "id": target_id,
+            "item_name": item_name,
+            "status": status or "OUT_OF_STOCK",
+            "price": price or target.get("denomination", ""),
+            "url": url,
+        }
 
     except Exception as e:
         logger.error(f"Error checking {item_name}: {e}")
@@ -822,4 +770,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Process terminated cleanly.")
-

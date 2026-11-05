@@ -476,26 +476,122 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
         if m_price:
             price_val = f"₹{m_price.group(1)}"
 
-        # Extract Status
+        # Extract Status with Multi-Layer Verification
         status = "OUT_OF_STOCK"
-        if re.search(r'availabilityStatus":"COMING_SOON"', page_html) or re.search(r'schema\.org[\\/]+OutOfStock', page_html):
+
+        # Layer 1: Surge / Edge Queue Screen Check
+        if "looks like all of india is here" in page_html.lower() or "hang in there" in page_html.lower():
+            logger.warning(f"Surge screen detected on {item_name}")
+            return {
+                "id": target_id,
+                "item_name": item_name,
+                "status": "SURGE_SCREEN",
+                "price": price_val or target.get("denomination", ""),
+                "url": direct_url,
+            }
+
+        # Layer 2: Explicit Out-of-Stock / Coming Soon Indicators
+        has_coming_soon = bool(re.search(r'availabilityStatus":"COMING_SOON"', page_html, re.IGNORECASE))
+        has_out_of_stock_schema = bool(re.search(r'schema\.org[\\/]+OutOfStock', page_html, re.IGNORECASE))
+        has_notify_me = bool(re.search(r'productActionButtonType":"NOTIFY_ME', page_html, re.IGNORECASE))
+        has_out_of_stock_text = any(
+            phrase in page_html.lower()
+            for phrase in [
+                "currently out of stock",
+                "this item is currently out of stock",
+                "sold out",
+                "item is out of stock",
+            ]
+        )
+
+        if has_coming_soon or has_out_of_stock_schema or has_notify_me or has_out_of_stock_text:
             status = "OUT_OF_STOCK"
-        elif re.search(r'availabilityStatus":"IN_STOCK"', page_html) or re.search(r'schema\.org[\\/]+InStock', page_html):
-            status = "IN_STOCK"
-        else:
-            # Fallback to button inspect
-            btn_texts = []
-            buttons = await page.query_selector_all("button, a")
-            for b in buttons:
+            logger.info(f"   [{item_name}] Decided OUT_OF_STOCK via explicit stock markers.")
+            return {
+                "id": target_id,
+                "item_name": item_name,
+                "status": status,
+                "price": price_val or target.get("denomination", ""),
+                "url": direct_url,
+            }
+
+        # Layer 3: Filter Out Ghost / Third-Party Unserviceable Sellers
+        # Official Sony PlayStation vouchers in India are issued by Sony Interactive Entertainment Europe / RetailNet.
+        # Known ghost sellers (e.g. SVPeripherals, TreasureEVERretailer) show dummy buttons with zero inventory.
+        is_ghost_seller = bool(re.search(r'(SVPeripherals|TreasureEVERretailer)', page_html, re.IGNORECASE))
+        if is_ghost_seller:
+            logger.info(f"   [{item_name}] Marked OUT_OF_STOCK (Ghost seller detected).")
+            return {
+                "id": target_id,
+                "item_name": item_name,
+                "status": "OUT_OF_STOCK",
+                "price": price_val or target.get("denomination", ""),
+                "url": direct_url,
+            }
+
+        # Layer 4: Action Button Inspection (Buy Now / Add to Cart)
+        has_action_buttons = False
+        action_selectors = [
+            'button:has-text("Buy now")',
+            'button:has-text("Add to cart")',
+            'button:has-text("BUY NOW")',
+            'button:has-text("ADD TO CART")',
+            'div:has-text("Buy now")',
+            'div:has-text("Add to cart")',
+        ]
+
+        found_btn = None
+        for sel in action_selectors:
+            btn = await page.query_selector(sel)
+            if btn:
                 try:
-                    btn_texts.append((await b.inner_text()).upper())
+                    is_disabled = await btn.evaluate(
+                        'el => el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true" || el.classList.contains("disabled")'
+                    )
+                    if not is_disabled:
+                        has_action_buttons = True
+                        found_btn = btn
+                        break
                 except Exception:
-                    pass
-            combined = " ".join(btn_texts)
-            if "BUY NOW" in combined or "ADD TO CART" in combined:
+                    has_action_buttons = True
+                    found_btn = btn
+                    break
+
+        if not has_action_buttons:
+            logger.info(f"   [{item_name}] No actionable Buy Now / Add to Cart buttons found.")
+            return {
+                "id": target_id,
+                "item_name": item_name,
+                "status": "OUT_OF_STOCK",
+                "price": price_val or target.get("denomination", ""),
+                "url": direct_url,
+            }
+
+        # Layer 5: In-Stock Verification via Cart Click confirmation
+        is_in_stock_json = bool(re.search(r'availabilityStatus":"IN_STOCK"', page_html, re.IGNORECASE)) or bool(re.search(r'schema\.org[\\/]+InStock', page_html, re.IGNORECASE))
+        if is_in_stock_json and has_action_buttons:
+            try:
+                cart_clickable = await page.query_selector('button:has-text("Add to cart"), div:has-text("Add to cart"), button:has-text("ADD TO CART")')
+                if cart_clickable:
+                    await cart_clickable.click(timeout=2500)
+                    await page.wait_for_timeout(2000)
+                    post_html = await page.content()
+
+                    if any(err in post_html.lower() for err in ["currently out of stock", "not deliverable", "cannot be delivered", "item unavailable", "sold out"]):
+                        logger.warning(f"   [{item_name}] Cart click failed with unserviceable/out-of-stock response.")
+                        status = "OUT_OF_STOCK"
+                    elif "GO TO CART" in post_html.upper() or "/viewcart" in page.url or "ADDED TO CART" in post_html.upper():
+                        logger.info(f"   [{item_name}] Cart click SUCCEEDED! Verified genuine in-stock item.")
+                        status = "IN_STOCK"
+                    else:
+                        status = "IN_STOCK"
+                else:
+                    status = "IN_STOCK"
+            except Exception as e:
+                logger.debug(f"Cart verification notice: {e}")
                 status = "IN_STOCK"
-            else:
-                status = "OUT_OF_STOCK"
+        else:
+            status = "OUT_OF_STOCK"
 
         return {
             "id": target_id,
@@ -578,8 +674,16 @@ async def run_monitor_cycle(
         should_alert = False
 
         if previous_status == "OUT_OF_STOCK" and current_status == "IN_STOCK":
-            logger.info(f"🚨 RESTOCK TRANSITION DETECTED for {item_name} on Flipkart!")
-            should_alert = True
+            logger.info(f"🔍 Potential restock detected for {item_name}. Running instant secondary confirmation check...")
+            await asyncio.sleep(2.5)
+            verify_result = await check_target_playwright(context, target)
+            if verify_result.get("status") == "IN_STOCK":
+                logger.info(f"🚨 CONFIRMED RESTOCK TRANSITION DETECTED for {item_name} on Flipkart!")
+                should_alert = True
+            else:
+                logger.warning(f"⚠️ Restock alert suppressed: secondary check returned {verify_result.get('status')}")
+                current_status = verify_result.get("status", "OUT_OF_STOCK")
+                LATEST_STOCK_STATE[target_id]["status"] = current_status
         elif previous_status is None and current_status == "IN_STOCK" and config.NOTIFY_ON_INITIAL_RUN:
             logger.info(f"🚨 Initial In-Stock detected for {item_name} on Flipkart!")
             should_alert = True

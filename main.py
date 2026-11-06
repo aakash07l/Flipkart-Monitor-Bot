@@ -10,6 +10,7 @@ import json
 import time
 import asyncio
 import logging
+import random
 import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, List
@@ -159,8 +160,21 @@ async def send_initial_summary_report(results: List[Dict[str, Any]]) -> bool:
 
     for item in results:
         status = item.get("status", "UNKNOWN")
-        badge = "🟢 In Stock" if status == "IN_STOCK" else ("🔴 Out of Stock" if status == "OUT_OF_STOCK" else f"⚪ {status}")
+        item_id = item.get("id", "")
         price_str = f" ({item.get('price')})" if item.get("price") else ""
+
+        # If a transient surge screen or error occurred in this cycle, use the last known stable status
+        if status in ("SURGE_SCREEN", "ERROR"):
+            cached_data = LATEST_STOCK_STATE.get(item_id, {})
+            cached_status = cached_data.get("status")
+            if cached_status in ("IN_STOCK", "OUT_OF_STOCK"):
+                status_icon = "🟢 In Stock" if cached_status == "IN_STOCK" else "🔴 Out of Stock"
+                badge = f"{status_icon} <i>(Akamai Queue)</i>"
+            else:
+                badge = f"⚪ {status}"
+        else:
+            badge = "🟢 In Stock" if status == "IN_STOCK" else ("🔴 Out of Stock" if status == "OUT_OF_STOCK" else f"⚪ {status}")
+
         lines.append(f"• <b>{item.get('item_name')}:</b> {badge}{price_str}")
 
     lines.append("\n⚡ <i>Continuous monitoring active. You will receive an instant alert the second any PlayStation card restocks!</i>")
@@ -179,8 +193,21 @@ async def send_periodic_summary_report(results: List[Dict[str, Any]], cycle_num:
 
     for item in results:
         status = item.get("status", "UNKNOWN")
-        badge = "🟢 In Stock" if status == "IN_STOCK" else ("🔴 Out of Stock" if status == "OUT_OF_STOCK" else f"⚪ {status}")
+        item_id = item.get("id", "")
         price_str = f" ({item.get('price')})" if item.get("price") else ""
+
+        # If a transient surge screen or error occurred in this cycle, use the last known stable status
+        if status in ("SURGE_SCREEN", "ERROR"):
+            cached_data = LATEST_STOCK_STATE.get(item_id, {})
+            cached_status = cached_data.get("status")
+            if cached_status in ("IN_STOCK", "OUT_OF_STOCK"):
+                status_icon = "🟢 In Stock" if cached_status == "IN_STOCK" else "🔴 Out of Stock"
+                badge = f"{status_icon} <i>(Akamai Queue)</i>"
+            else:
+                badge = f"⚪ {status}"
+        else:
+            badge = "🟢 In Stock" if status == "IN_STOCK" else ("🔴 Out of Stock" if status == "OUT_OF_STOCK" else f"⚪ {status}")
+
         lines.append(f"• <b>{item.get('item_name')}:</b> {badge}{price_str}")
 
     lines.append("\n✅ <i>Bot is active 24/7. Instant restock alert will fire immediately when stock appears!</i>")
@@ -479,16 +506,43 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
         # Extract Status with Multi-Layer Verification
         status = "OUT_OF_STOCK"
 
-        # Layer 1: Surge / Edge Queue Screen Check
-        if "looks like all of india is here" in page_html.lower() or "hang in there" in page_html.lower():
-            logger.warning(f"Surge screen detected on {item_name}")
-            return {
-                "id": target_id,
-                "item_name": item_name,
-                "status": "SURGE_SCREEN",
-                "price": price_val or target.get("denomination", ""),
-                "url": direct_url,
-            }
+        # Layer 1: Surge / Edge Queue Screen Check with In-Session Auto-Retry
+        is_surge = ("looks like all of india is here" in page_html.lower() or "hang in there" in page_html.lower())
+        if is_surge:
+            logger.warning(f"Surge / Queue screen detected on {item_name}. Attempting in-session recovery...")
+            for attempt in range(1, 3):
+                try:
+                    await page.wait_for_timeout(3500)
+                    retry_btn = await page.query_selector('a:has-text("retry now"), button:has-text("retry now"), text="retry now"')
+                    if retry_btn:
+                        await retry_btn.click()
+                    else:
+                        await page.reload(wait_until="domcontentloaded", timeout=25000)
+
+                    await page.wait_for_timeout(3000)
+                    page_html = await page.content()
+                    page_title = await page.title()
+
+                    if "looks like all of india is here" not in page_html.lower() and "hang in there" not in page_html.lower():
+                        logger.info(f"   [{item_name}] Surge screen successfully bypassed on recovery attempt #{attempt}!")
+                        is_surge = False
+                        # Re-extract price if available after recovery
+                        m_price = re.search(r'"price":\s*(\d+)', page_html)
+                        if m_price:
+                            price_val = f"₹{m_price.group(1)}"
+                        break
+                except Exception as e:
+                    logger.debug(f"Surge recovery retry #{attempt} notice: {e}")
+
+            if is_surge:
+                logger.warning(f"Surge screen persisted for {item_name} after recovery attempts.")
+                return {
+                    "id": target_id,
+                    "item_name": item_name,
+                    "status": "SURGE_SCREEN",
+                    "price": price_val or target.get("denomination", ""),
+                    "url": direct_url,
+                }
 
         # Layer 2: Explicit Out-of-Stock / Coming Soon Indicators
         has_coming_soon = bool(re.search(r'availabilityStatus":"COMING_SOON"', page_html, re.IGNORECASE))
@@ -706,8 +760,9 @@ async def run_monitor_cycle(
             }
             save_state(state)
 
-        # Gentle delay between items
-        await asyncio.sleep(config.SITE_CHECK_DELAY_SECONDS)
+        # Gentle human-like jitter delay between items (e.g. 3.0s to 5.5s) to avoid Akamai rate spikes
+        jitter_delay = random.uniform(config.SITE_CHECK_DELAY_SECONDS, config.SITE_CHECK_DELAY_SECONDS + 2.5)
+        await asyncio.sleep(jitter_delay)
 
     # First cycle overview to Telegram
     if is_first_cycle:
@@ -798,8 +853,9 @@ async def main():
             except Exception as e:
                 logger.error(f"Unexpected error during monitor cycle #{TOTAL_CYCLES_COMPLETED}: {e}", exc_info=True)
 
-            logger.info(f"Sleeping for {config.CHECK_INTERVAL_SECONDS}s before next sweep...\n")
-            await asyncio.sleep(config.CHECK_INTERVAL_SECONDS)
+            cycle_sleep = max(60.0, config.CHECK_INTERVAL_SECONDS + random.uniform(-4.0, 4.0))
+            logger.info(f"Sleeping for {int(cycle_sleep)}s before next sweep...\n")
+            await asyncio.sleep(cycle_sleep)
 
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Shutting down Flipkart PlayStation Monitor...")

@@ -550,15 +550,15 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
         # Extract Status with Multi-Layer Verification
         status = "OUT_OF_STOCK"
 
-        # Layer 1: True Surge / Edge Queue Screen Check with Clean-Session Auto-Retry
+        # Layer 1: True Surge / Edge Queue Screen Check with Single Clean-Session Retry
         is_surge = await is_real_surge_screen(page, page_html)
         if is_surge:
-            logger.warning(f"Real Surge / Queue screen detected on {item_name}. Resetting session & retrying...")
-            for attempt in range(1, 3):
+            logger.warning(f"Real Surge / Queue screen detected on {item_name}. Resetting session & retrying once...")
+            for attempt in range(1, 2):
                 try:
                     await reset_gateway_cookies(context)
                     await page.wait_for_timeout(3500)
-                    retry_url = convert_to_gateway_url(direct_url, mobile=(attempt == 2))
+                    retry_url = convert_to_gateway_url(direct_url, mobile=True)
                     await page.goto(retry_url, wait_until="domcontentloaded", timeout=25000)
                     await page.wait_for_timeout(3000)
                     page_html = await page.content()
@@ -733,8 +733,8 @@ async def run_monitor_cycle(
     context: Optional[BrowserContext],
     state: Dict[str, Any],
     is_first_cycle: bool = False,
-):
-    """Executes a single check cycle across all Flipkart PlayStation targets."""
+) -> bool:
+    """Executes a single check cycle across all Flipkart PlayStation targets. Returns True if surge circuit breaker tripped."""
     global TOTAL_CYCLES_COMPLETED
     TOTAL_CYCLES_COMPLETED += 1
 
@@ -746,11 +746,11 @@ async def run_monitor_cycle(
     logger.info("=" * 60)
 
     cycle_results: List[Dict[str, Any]] = []
+    consecutive_surges = 0
+    surge_tripped = False
+    enabled_targets = [t for t in config.TARGET_SITES if t.get("enabled", True)]
 
-    for target in config.TARGET_SITES:
-        if not target.get("enabled", True):
-            continue
-
+    for idx, target in enumerate(enabled_targets):
         target_id = target["id"]
         item_name = target["item_name"]
         direct_url = target["url"]
@@ -761,6 +761,11 @@ async def run_monitor_cycle(
         current_status = result.get("status", "UNKNOWN")
         price = result.get("price", "")
         cycle_results.append(result)
+
+        if current_status == "SURGE_SCREEN":
+            consecutive_surges += 1
+        else:
+            consecutive_surges = 0
 
         previous_data = state.get(target_id, {})
         previous_status = previous_data.get("status")
@@ -813,6 +818,28 @@ async def run_monitor_cycle(
             }
             save_state(state)
 
+        # Surge Circuit Breaker: stop hammering gateway if 2 consecutive items return SURGE_SCREEN
+        if consecutive_surges >= 2:
+            surge_tripped = True
+            logger.warning("🚨 Surge Circuit Breaker tripped (2 consecutive SURGE_SCREEN). Pausing remaining checks to let Akamai cooldown reset.")
+            for rem_target in enabled_targets[idx + 1:]:
+                rem_id = rem_target["id"]
+                cycle_results.append({
+                    "id": rem_id,
+                    "item_name": rem_target["item_name"],
+                    "status": "SURGE_SCREEN",
+                    "price": rem_target.get("denomination", ""),
+                    "url": rem_target["url"],
+                })
+                LATEST_STOCK_STATE[rem_id] = {
+                    "item_name": rem_target["item_name"],
+                    "status": "SURGE_SCREEN",
+                    "last_price": rem_target.get("denomination", ""),
+                    "url": rem_target["url"],
+                    "last_checked": datetime.datetime.now().isoformat(),
+                }
+            break
+
         # Gentle human-like jitter delay between items (e.g. 3.0s to 5.5s) to avoid Akamai rate spikes
         jitter_delay = random.uniform(config.SITE_CHECK_DELAY_SECONDS, config.SITE_CHECK_DELAY_SECONDS + 2.5)
         await asyncio.sleep(jitter_delay)
@@ -831,6 +858,7 @@ async def run_monitor_cycle(
         await send_heartbeat_notification(TOTAL_CYCLES_COMPLETED)
 
     logger.info("✅ Cycle complete. Resting until next interval.")
+    return surge_tripped
 
 
 # ==========================================
@@ -895,17 +923,24 @@ async def main():
     is_first = True
     try:
         while True:
+            surge_tripped = False
             try:
                 if context and TOTAL_CYCLES_COMPLETED > 0 and TOTAL_CYCLES_COMPLETED % 30 == 0:
                     logger.info("Refreshing browser cookies proactively to prevent Akamai session flagging...")
                     await reset_gateway_cookies(context)
-                await run_monitor_cycle(browser, context, state, is_first_cycle=is_first)
+                surge_tripped = await run_monitor_cycle(browser, context, state, is_first_cycle=is_first)
                 is_first = False
             except Exception as e:
                 logger.error(f"Unexpected error during monitor cycle #{TOTAL_CYCLES_COMPLETED}: {e}", exc_info=True)
 
-            cycle_sleep = max(60.0, config.CHECK_INTERVAL_SECONDS + random.uniform(-4.0, 4.0))
-            logger.info(f"Sleeping for {int(cycle_sleep)}s before next sweep...\n")
+            if surge_tripped:
+                if context:
+                    await reset_gateway_cookies(context)
+                cycle_sleep = config.SURGE_COOLDOWN_SECONDS + random.uniform(0.0, 30.0)
+                logger.warning(f"⏳ Surge cooldown active: sleeping {int(cycle_sleep)}s before next sweep...")
+            else:
+                cycle_sleep = max(60.0, config.CHECK_INTERVAL_SECONDS + random.uniform(-5.0, 5.0))
+                logger.info(f"Sleeping for {int(cycle_sleep)}s before next sweep...\n")
             await asyncio.sleep(cycle_sleep)
 
     except (KeyboardInterrupt, asyncio.CancelledError):

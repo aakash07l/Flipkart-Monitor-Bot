@@ -27,8 +27,11 @@ TELEGRAM_CHAT_ID = ",".join(TELEGRAM_CHAT_IDS)
 # ==========================================
 # 2. Monitoring & Bot Behavior Settings
 # ==========================================
-# Check interval in seconds (90s = 1.5 minutes to prevent Flipkart rate-limiting/blocking)
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "90"))
+# Check interval in seconds (120s = 2 minutes to prevent Flipkart/Gateway rate-limiting)
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "120"))
+
+# Cooldown sleep in seconds when Surge Circuit Breaker trips (300s = 5 minutes)
+SURGE_COOLDOWN_SECONDS = int(os.getenv("SURGE_COOLDOWN_SECONDS", "300"))
 
 # Delay between checking each individual item (seconds)
 SITE_CHECK_DELAY_SECONDS = int(os.getenv("SITE_CHECK_DELAY_SECONDS", "3"))
@@ -42,11 +45,11 @@ SEND_STARTUP_MESSAGE = os.getenv("SEND_STARTUP_MESSAGE", "True").lower() in ("tr
 # Send full summary report after the very first check cycle
 SEND_INITIAL_SUMMARY = os.getenv("SEND_INITIAL_SUMMARY", "True").lower() in ("true", "1", "yes")
 
-# Send regular periodic summary update report (every 40 cycles ~ 1 hour)
-PERIODIC_SUMMARY_CYCLES = int(os.getenv("PERIODIC_SUMMARY_CYCLES", "40"))
+# Send regular periodic summary update report (every 30 cycles ~ 1 hour)
+PERIODIC_SUMMARY_CYCLES = int(os.getenv("PERIODIC_SUMMARY_CYCLES", "30"))
 
-# Periodic heartbeat ping to Telegram (every 160 cycles ~ 4 hours). 0 to disable
-HEARTBEAT_CYCLE_INTERVAL = int(os.getenv("HEARTBEAT_CYCLE_INTERVAL", "160"))
+# Periodic heartbeat ping to Telegram (every 120 cycles ~ 4 hours). 0 to disable
+HEARTBEAT_CYCLE_INTERVAL = int(os.getenv("HEARTBEAT_CYCLE_INTERVAL", "120"))
 
 # Browser page navigation timeout in milliseconds
 PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "35000"))

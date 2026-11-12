@@ -447,11 +447,52 @@ async def start_keep_alive_server():
 # ==========================================
 # Stock Extraction via Playwright + Gateway
 # ==========================================
-def convert_to_gateway_url(flipkart_url: str) -> str:
+def convert_to_gateway_url(flipkart_url: str, mobile: bool = False) -> str:
     """Converts a direct Flipkart URL into a Google Global Gateway URL."""
-    clean_url = flipkart_url.replace("https://www.flipkart.com", "https://www-flipkart-com.translate.goog")
+    host = "https://m-flipkart-com.translate.goog" if mobile else "https://www-flipkart-com.translate.goog"
+    clean_url = flipkart_url.replace("https://www.flipkart.com", host)
     sep = "&" if "?" in clean_url else "?"
     return f"{clean_url}{sep}_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en"
+
+
+async def reset_gateway_cookies(context: BrowserContext):
+    """Wipes stale/flagged Akamai & Flipkart cookies while preserving Google Consent cookies."""
+    try:
+        await context.clear_cookies()
+        await context.add_cookies([
+            {"name": "CONSENT", "value": "YES+cb.20210720-07-p0.en+FX+417", "domain": ".translate.goog", "path": "/"},
+            {"name": "SOCS", "value": "CAISHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg", "domain": ".translate.goog", "path": "/"},
+            {"name": "CONSENT", "value": "YES+cb.20210720-07-p0.en+FX+417", "domain": ".google.com", "path": "/"},
+            {"name": "SOCS", "value": "CAISHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg", "domain": ".google.com", "path": "/"},
+        ])
+    except Exception as e:
+        logger.debug(f"Cookie reset notice: {e}")
+
+
+async def is_real_surge_screen(page: Page, page_html: str) -> bool:
+    """
+    Detects an actual Flipkart Akamai surge/queue screen without false-triggering
+    on Flipkart's embedded `statusCodesConfig` JSON inside valid 1MB product pages.
+    """
+    has_product_data = bool(re.search(r'"availabilityStatus"\s*:', page_html)) or (
+        "window.__INITIAL_STATE__" in page_html and len(page_html) > 50000
+    )
+    if has_product_data:
+        return False
+
+    body_text = ""
+    try:
+        body_text = (await page.inner_text("body")).lower()
+    except Exception:
+        body_text = page_html.lower()
+
+    if "looks like all of india is here" in body_text or "hang in there" in body_text:
+        return True
+
+    if len(page_html) < 25000 and ("looks like all of india is here" in page_html.lower() or "hang in there" in page_html.lower()):
+        return True
+
+    return False
 
 
 async def check_target_playwright(context: BrowserContext, target: Dict[str, Any]) -> Dict[str, Any]:
@@ -459,15 +500,18 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
     target_id = target["id"]
     item_name = target["item_name"]
     direct_url = target["url"]
-    gateway_url = convert_to_gateway_url(direct_url)
+    gateway_url = convert_to_gateway_url(direct_url, mobile=False)
 
     page: Optional[Page] = None
     try:
         page = await context.new_page()
 
-        # Abort heavy media to save RAM/CPU
+        # Abort heavy media, fonts, images, and analytics trackers to cut gateway request burst by ~80%
+        blocked_domains = ("newrelic", "nr-data", "omtrdc", "demdex", "googletagmanager", "doubleclick", "youtube")
+
         async def block_media(route):
-            if route.request.resource_type in ["media"]:
+            req = route.request
+            if req.resource_type in ("media", "image", "font") or any(d in req.url for d in blocked_domains):
                 await route.abort()
             else:
                 await route.continue_()
@@ -506,27 +550,23 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
         # Extract Status with Multi-Layer Verification
         status = "OUT_OF_STOCK"
 
-        # Layer 1: Surge / Edge Queue Screen Check with In-Session Auto-Retry
-        is_surge = ("looks like all of india is here" in page_html.lower() or "hang in there" in page_html.lower())
+        # Layer 1: True Surge / Edge Queue Screen Check with Clean-Session Auto-Retry
+        is_surge = await is_real_surge_screen(page, page_html)
         if is_surge:
-            logger.warning(f"Surge / Queue screen detected on {item_name}. Attempting in-session recovery...")
+            logger.warning(f"Real Surge / Queue screen detected on {item_name}. Resetting session & retrying...")
             for attempt in range(1, 3):
                 try:
+                    await reset_gateway_cookies(context)
                     await page.wait_for_timeout(3500)
-                    retry_btn = await page.query_selector('a:has-text("retry now"), button:has-text("retry now"), text="retry now"')
-                    if retry_btn:
-                        await retry_btn.click()
-                    else:
-                        await page.reload(wait_until="domcontentloaded", timeout=25000)
-
+                    retry_url = convert_to_gateway_url(direct_url, mobile=(attempt == 2))
+                    await page.goto(retry_url, wait_until="domcontentloaded", timeout=25000)
                     await page.wait_for_timeout(3000)
                     page_html = await page.content()
                     page_title = await page.title()
 
-                    if "looks like all of india is here" not in page_html.lower() and "hang in there" not in page_html.lower():
-                        logger.info(f"   [{item_name}] Surge screen successfully bypassed on recovery attempt #{attempt}!")
+                    if not await is_real_surge_screen(page, page_html):
+                        logger.info(f"   [{item_name}] Surge screen bypassed on recovery attempt #{attempt}!")
                         is_surge = False
-                        # Re-extract price if available after recovery
                         m_price = re.search(r'"price":\s*(\d+)', page_html)
                         if m_price:
                             price_val = f"₹{m_price.group(1)}"
@@ -543,6 +583,17 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
                     "price": price_val or target.get("denomination", ""),
                     "url": direct_url,
                 }
+
+        # Guard: if page is unexpectedly tiny without product state (e.g. gateway 429/timeout), report ERROR instead of guessing
+        if len(page_html) < 25000 and not re.search(r'"availabilityStatus"\s*:', page_html):
+            logger.warning(f"   [{item_name}] Unexpectedly small page ({len(page_html)} bytes), marking ERROR.")
+            return {
+                "id": target_id,
+                "item_name": item_name,
+                "status": "ERROR",
+                "price": price_val or target.get("denomination", ""),
+                "url": direct_url,
+            }
 
         # Layer 2: Explicit Out-of-Stock / Coming Soon Indicators
         has_coming_soon = bool(re.search(r'availabilityStatus":"COMING_SOON"', page_html, re.IGNORECASE))
@@ -590,8 +641,8 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
             'button:has-text("Add to cart")',
             'button:has-text("BUY NOW")',
             'button:has-text("ADD TO CART")',
-            'div:has-text("Buy now")',
-            'div:has-text("Add to cart")',
+            'div[dir="auto"]:text-is("Buy now")',
+            'div[dir="auto"]:text-is("Add to cart")',
         ]
 
         found_btn = None
@@ -625,7 +676,9 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
         is_in_stock_json = bool(re.search(r'availabilityStatus":"IN_STOCK"', page_html, re.IGNORECASE)) or bool(re.search(r'schema\.org[\\/]+InStock', page_html, re.IGNORECASE))
         if is_in_stock_json and has_action_buttons:
             try:
-                cart_clickable = await page.query_selector('button:has-text("Add to cart"), div:has-text("Add to cart"), button:has-text("ADD TO CART")')
+                cart_clickable = await page.query_selector(
+                    'button:has-text("Add to cart"), button:has-text("ADD TO CART"), div[dir="auto"]:text-is("Add to cart")'
+                )
                 if cart_clickable:
                     await cart_clickable.click(timeout=2500)
                     await page.wait_for_timeout(2000)
@@ -828,12 +881,7 @@ async def main():
         await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); window.chrome = {runtime: {}};")
 
         # Inject Google consent cookies for both domains so Google never 429s or blocks
-        await context.add_cookies([
-            {"name": "CONSENT", "value": "YES+cb.20210720-07-p0.en+FX+417", "domain": ".translate.goog", "path": "/"},
-            {"name": "SOCS", "value": "CAISHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg", "domain": ".translate.goog", "path": "/"},
-            {"name": "CONSENT", "value": "YES+cb.20210720-07-p0.en+FX+417", "domain": ".google.com", "path": "/"},
-            {"name": "SOCS", "value": "CAISHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg", "domain": ".google.com", "path": "/"},
-        ])
+        await reset_gateway_cookies(context)
         logger.info("Playwright Headless Chromium successfully initialized with Mumbai geo & gateway cookies.")
 
     except Exception as e:
@@ -848,6 +896,9 @@ async def main():
     try:
         while True:
             try:
+                if context and TOTAL_CYCLES_COMPLETED > 0 and TOTAL_CYCLES_COMPLETED % 30 == 0:
+                    logger.info("Refreshing browser cookies proactively to prevent Akamai session flagging...")
+                    await reset_gateway_cookies(context)
                 await run_monitor_cycle(browser, context, state, is_first_cycle=is_first)
                 is_first = False
             except Exception as e:

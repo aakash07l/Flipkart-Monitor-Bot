@@ -136,7 +136,7 @@ async def send_startup_notification(engine_info: str = "Playwright Global Gatewa
         f"⚡ <b>Status:</b> 🟢 <b>Online & Running 24/7</b>\n"
         f"🌐 <b>Engine:</b> {engine_info}\n"
         f"⏱️ <b>Check Interval:</b> Every {config.CHECK_INTERVAL_SECONDS}s (~1.5 min)\n"
-        f"📍 <b>Location Bypass:</b> Native Indian Server (Bangalore Direct)\n\n"
+        f"📍 <b>Location Bypass:</b> Cloudflare Residential Proxy Active\n\n"
         f"📦 <b>Direct Monitored Targets:</b>\n{items_list}\n\n"
         f"🕒 <b>Started At:</b> {formatted_time}\n\n"
         f"🔍 <i>Performing initial stock sweep now...</i>"
@@ -445,74 +445,20 @@ async def start_keep_alive_server():
 
 
 # ==========================================
-# Stock Extraction via Playwright + Gateway
+# Stock Extraction via Playwright (Cloudflare Reverse Proxy)
 # ==========================================
-def convert_to_gateway_url(flipkart_url: str) -> str:
-    """Converts a direct Flipkart URL into a Google Global Gateway URL."""
-    clean_url = flipkart_url.replace("https://www.flipkart.com", "https://www-flipkart-com.translate.goog")
-    sep = "&" if "?" in clean_url else "?"
-    return f"{clean_url}{sep}_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en"
-
-
-async def warmup_gateway_session(context: BrowserContext) -> bool:
-    """
-    Navigates to Google Translate gateway once to accept consent and establish a live session.
-    Must be called once at startup before any product checks.
-    Returns True if session was established successfully.
-    """
-    warmup_url = convert_to_gateway_url("https://www.flipkart.com/")
-    logger.info(f"Warming up Google Translate gateway session...")
-    page = None
-    try:
-        page = await context.new_page()
-        await page.goto(warmup_url, timeout=35000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
-
-        # Click any Google consent/accept button if present
-        for sel in [
-            'button:has-text("Accept all")',
-            'button:has-text("I agree")',
-            'button:has-text("Agree")',
-            'button[aria-label="Accept all"]',
-            'form[action*="consent"] button',
-        ]:
-            btn = await page.query_selector(sel)
-            if btn:
-                try:
-                    await btn.click()
-                    await page.wait_for_timeout(3000)
-                    logger.info("Gateway consent button clicked successfully.")
-                    break
-                except Exception:
-                    pass
-
-        # Wait for full page load after consent
-        try:
-            await page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception:
-            pass
-
-        html = await page.content()
-        size = len(html)
-        logger.info(f"Gateway warmup complete. Page size: {size} bytes.")
-        return size > 50000  # Success = got a real Flipkart page (>50KB)
-    except Exception as e:
-        logger.warning(f"Gateway warmup notice: {e}")
-        return False
-    finally:
-        if page:
-            try:
-                await page.close()
-            except Exception:
-                pass
+def convert_to_proxy_url(flipkart_url: str) -> str:
+    """Converts a direct Flipkart URL into a Cloudflare Reverse Proxy URL."""
+    base_proxy = config.CLOUDFLARE_PROXY_URL
+    return flipkart_url.replace("https://www.flipkart.com", base_proxy)
 
 
 async def check_target_playwright(context: BrowserContext, target: Dict[str, Any]) -> Dict[str, Any]:
-    """Inspects Flipkart stock through Playwright-rendered Gateway."""
+    """Inspects Flipkart stock through Cloudflare-proxied page."""
     target_id = target["id"]
     item_name = target["item_name"]
     direct_url = target["url"]
-    gateway_url = convert_to_gateway_url(direct_url)
+    proxy_url = convert_to_proxy_url(direct_url)
 
     page: Optional[Page] = None
     try:
@@ -530,27 +476,12 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
 
         await page.route("**/*", block_media)
 
-        # Navigate via Playwright to the Gateway URL
+        # Navigate via Playwright to the Proxied Flipkart URL
         try:
-            await page.goto(gateway_url, timeout=35000, wait_until="networkidle")
+            await page.goto(proxy_url, timeout=30000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(2500)
         except Exception as e:
             logger.warning(f"Navigation notice for {item_name}: {e}")
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=10000)
-            except Exception:
-                pass
-
-        # Explicitly wait for Flipkart's __INITIAL_STATE__ JS object to be injected
-        # (block_media causes networkidle to fire early before JS finishes injecting state)
-        try:
-            await page.wait_for_function(
-                "() => !!(window.__INITIAL_STATE__ && typeof window.__INITIAL_STATE__ === 'object' && Object.keys(window.__INITIAL_STATE__).length > 2)",
-                timeout=18000
-            )
-            logger.debug(f"   [{item_name}] __INITIAL_STATE__ detected in DOM.")
-        except Exception:
-            # Fallback: just wait a bit longer
-            await page.wait_for_timeout(4000)
 
         page_html = await page.content()
         page_title = await page.title()
@@ -563,26 +494,16 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
         if m_price:
             price_val = f"₹{m_price.group(1)}"
 
-        # Surge Detection: ONLY flag as surge if page explicitly shows surge text
-        # (never trigger on page-size alone — Playwright may get partial pages on slow loads)
-        page_lower = page_html.lower()
-        is_surge = (
-            "looks like all of india is here" in page_lower or
-            "hang in there, the offers are worth the wait" in page_lower
-        ) and not re.search(r'"availabilityStatus"\s*:', page_html)
-
+        # Guard: check if rate-limit/surge page appeared (< 25KB and missing product JSON)
+        is_surge = len(page_html) < 25000 and not re.search(r'"availabilityStatus"\s*:', page_html)
         if is_surge:
-            logger.warning(f"   [{item_name}] Surge/Queue screen confirmed ({len(page_html)} bytes). Retrying once after wait...")
+            logger.warning(f"   [{item_name}] Rate-limit / surge detected ({len(page_html)} bytes). Retrying once...")
             try:
-                await page.wait_for_timeout(5000)
-                await page.goto(gateway_url, timeout=35000, wait_until="networkidle")
+                await page.wait_for_timeout(4000)
+                await page.goto(proxy_url, timeout=25000, wait_until="domcontentloaded")
                 await page.wait_for_timeout(3000)
                 page_html = await page.content()
-                page_lower = page_html.lower()
-                is_surge = (
-                    "looks like all of india is here" in page_lower or
-                    "hang in there, the offers are worth the wait" in page_lower
-                ) and not re.search(r'"availabilityStatus"\s*:', page_html)
+                is_surge = len(page_html) < 25000 and not re.search(r'"availabilityStatus"\s*:', page_html)
             except Exception as e:
                 logger.debug(f"Retry notice: {e}")
 
@@ -594,17 +515,6 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
                     "price": price_val or target.get("denomination", ""),
                     "url": direct_url,
                 }
-
-        # Guard: if page is very small and has no product data at all, mark ERROR
-        if len(page_html) < 10000 and not re.search(r'"availabilityStatus"\s*:', page_html):
-            logger.warning(f"   [{item_name}] Page too small and no product data ({len(page_html)} bytes), marking ERROR.")
-            return {
-                "id": target_id,
-                "item_name": item_name,
-                "status": "ERROR",
-                "price": price_val or target.get("denomination", ""),
-                "url": direct_url,
-            }
 
         # Layer 2: Explicit Out-of-Stock / Coming Soon Indicators
         has_coming_soon = bool(re.search(r'availabilityStatus":"COMING_SOON"', page_html, re.IGNORECASE))
@@ -865,7 +775,7 @@ async def main():
     playwright_instance = None
     browser = None
     context = None
-    engine_info = "Playwright Chromium (Direct Flipkart / Indian Droplet)"
+    engine_info = "Playwright Chromium (Cloudflare Edge Proxy Mode)"
 
     try:
         playwright_instance = await async_playwright().start()
@@ -888,23 +798,7 @@ async def main():
             timezone_id="Asia/Kolkata",
         )
         await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); window.chrome = {runtime: {}};")
-
-        # Inject Google consent cookies for smooth gateway access
-        await context.add_cookies([
-            {"name": "CONSENT", "value": "YES+cb.20210720-07-p0.en+FX+417", "domain": ".translate.goog", "path": "/"},
-            {"name": "SOCS", "value": "CAISHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg", "domain": ".translate.goog", "path": "/"},
-            {"name": "CONSENT", "value": "YES+cb.20210720-07-p0.en+FX+417", "domain": ".google.com", "path": "/"},
-            {"name": "SOCS", "value": "CAISHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg", "domain": ".google.com", "path": "/"},
-        ])
-        logger.info("Playwright Headless Chromium successfully initialized with Bangalore geolocation & Gateway.")
-
-        # Warm up gateway session: navigate to Flipkart homepage via gateway once to accept consent
-        session_ok = await warmup_gateway_session(context)
-        if session_ok:
-            logger.info("✅ Gateway session warmup succeeded — full product pages will load correctly.")
-            engine_info = "Playwright Chromium (Gateway Mode / Indian Droplet)"
-        else:
-            logger.warning("⚠️ Gateway session warmup page was small — consent may not have been accepted. Proceeding anyway.")
+        logger.info("Playwright Headless Chromium successfully initialized with Cloudflare Edge Proxy.")
 
     except Exception as e:
         logger.error(f"Failed to start Playwright browser: {e}")

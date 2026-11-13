@@ -54,6 +54,9 @@ PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "35000"))
 # State persistence file
 STATE_FILE_PATH = os.getenv("STATE_FILE_PATH", "stock_state.json")
 
+# Cloudflare Reverse Proxy URL to bypass Akamai datacenter blocking with 100% genuine full pages
+CLOUDFLARE_PROXY_URL = os.getenv("CLOUDFLARE_PROXY_URL", "https://flipkart-proxy.aakashlohar7.workers.dev").rstrip("/")
+
 # Built-in Keep-Alive Web Server port (for EC2 / Railway / Replit)
 KEEP_ALIVE_PORT = int(os.getenv("PORT", "8080"))
 

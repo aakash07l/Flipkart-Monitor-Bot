@@ -445,13 +445,21 @@ async def start_keep_alive_server():
 
 
 # ==========================================
-# Stock Extraction via Playwright (Direct Flipkart)
+# Stock Extraction via Playwright + Gateway
 # ==========================================
+def convert_to_gateway_url(flipkart_url: str) -> str:
+    """Converts a direct Flipkart URL into a Google Global Gateway URL."""
+    clean_url = flipkart_url.replace("https://www.flipkart.com", "https://www-flipkart-com.translate.goog")
+    sep = "&" if "?" in clean_url else "?"
+    return f"{clean_url}{sep}_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en"
+
+
 async def check_target_playwright(context: BrowserContext, target: Dict[str, Any]) -> Dict[str, Any]:
-    """Inspects Flipkart stock through Playwright headless browser."""
+    """Inspects Flipkart stock through Playwright-rendered Gateway."""
     target_id = target["id"]
     item_name = target["item_name"]
     direct_url = target["url"]
+    gateway_url = convert_to_gateway_url(direct_url)
 
     page: Optional[Page] = None
     try:
@@ -469,12 +477,23 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
 
         await page.route("**/*", block_media)
 
-        # Navigate directly to Flipkart URL
+        # Navigate via Playwright to the Gateway URL
         try:
-            await page.goto(direct_url, timeout=30000, wait_until="domcontentloaded")
+            await page.goto(gateway_url, timeout=30000, wait_until="domcontentloaded")
             await page.wait_for_timeout(2500)
         except Exception as e:
             logger.warning(f"Navigation notice for {item_name}: {e}")
+
+        # Check for Google consent screen and auto-click accept
+        for sel in ['button:has-text("Accept all")', 'button:has-text("I agree")', 'button[aria-label="Accept all"]', 'form[action*="consent"] button']:
+            btn = await page.query_selector(sel)
+            if btn:
+                try:
+                    await btn.click()
+                    await page.wait_for_timeout(2500)
+                    break
+                except Exception:
+                    pass
 
         page_html = await page.content()
         page_title = await page.title()
@@ -490,10 +509,10 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
         # Guard: check if Akamai rate-limit/surge page appeared (< 25KB and missing product JSON)
         is_surge = len(page_html) < 25000 and not re.search(r'"availabilityStatus"\s*:', page_html)
         if is_surge:
-            logger.warning(f"   [{item_name}] Temporary rate-limit / surge detected ({len(page_html)} bytes). Retrying once...")
+            logger.warning(f"   [{item_name}] Rate-limit / surge detected ({len(page_html)} bytes). Retrying once...")
             try:
                 await page.wait_for_timeout(4000)
-                await page.goto(direct_url, timeout=25000, wait_until="domcontentloaded")
+                await page.goto(gateway_url, timeout=25000, wait_until="domcontentloaded")
                 await page.wait_for_timeout(3000)
                 page_html = await page.content()
                 is_surge = len(page_html) < 25000 and not re.search(r'"availabilityStatus"\s*:', page_html)
@@ -791,7 +810,15 @@ async def main():
             timezone_id="Asia/Kolkata",
         )
         await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); window.chrome = {runtime: {}};")
-        logger.info("Playwright Headless Chromium successfully initialized with Bangalore geolocation.")
+
+        # Inject Google consent cookies for smooth gateway access
+        await context.add_cookies([
+            {"name": "CONSENT", "value": "YES+cb.20210720-07-p0.en+FX+417", "domain": ".translate.goog", "path": "/"},
+            {"name": "SOCS", "value": "CAISHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg", "domain": ".translate.goog", "path": "/"},
+            {"name": "CONSENT", "value": "YES+cb.20210720-07-p0.en+FX+417", "domain": ".google.com", "path": "/"},
+            {"name": "SOCS", "value": "CAISHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg", "domain": ".google.com", "path": "/"},
+        ])
+        logger.info("Playwright Headless Chromium successfully initialized with Bangalore geolocation & Gateway.")
 
     except Exception as e:
         logger.error(f"Failed to start Playwright browser: {e}")

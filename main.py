@@ -135,8 +135,8 @@ async def send_startup_notification(engine_info: str = "Playwright Global Gatewa
         f"🎮 <b>Flipkart PlayStation Stock Monitor Started!</b>\n\n"
         f"⚡ <b>Status:</b> 🟢 <b>Online & Running 24/7</b>\n"
         f"🌐 <b>Engine:</b> {engine_info}\n"
-        f"⏱️ <b>Check Interval:</b> Every {config.CHECK_INTERVAL_SECONDS} seconds (1.5 min)\n"
-        f"📍 <b>Location Bypass:</b> Mumbai Geo + Gateway Active\n\n"
+        f"⏱️ <b>Check Interval:</b> Every {config.CHECK_INTERVAL_SECONDS}s (~1.5 min)\n"
+        f"📍 <b>Location Bypass:</b> Native Indian Server (Bangalore Direct)\n\n"
         f"📦 <b>Direct Monitored Targets:</b>\n{items_list}\n\n"
         f"🕒 <b>Started At:</b> {formatted_time}\n\n"
         f"🔍 <i>Performing initial stock sweep now...</i>"
@@ -445,68 +445,19 @@ async def start_keep_alive_server():
 
 
 # ==========================================
-# Stock Extraction via Playwright + Gateway
+# Stock Extraction via Playwright (Direct Flipkart)
 # ==========================================
-def convert_to_gateway_url(flipkart_url: str, mobile: bool = False) -> str:
-    """Converts a direct Flipkart URL into a Google Global Gateway URL."""
-    host = "https://m-flipkart-com.translate.goog" if mobile else "https://www-flipkart-com.translate.goog"
-    clean_url = flipkart_url.replace("https://www.flipkart.com", host)
-    sep = "&" if "?" in clean_url else "?"
-    return f"{clean_url}{sep}_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en"
-
-
-async def reset_gateway_cookies(context: BrowserContext):
-    """Wipes stale/flagged Akamai & Flipkart cookies while preserving Google Consent cookies."""
-    try:
-        await context.clear_cookies()
-        await context.add_cookies([
-            {"name": "CONSENT", "value": "YES+cb.20210720-07-p0.en+FX+417", "domain": ".translate.goog", "path": "/"},
-            {"name": "SOCS", "value": "CAISHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg", "domain": ".translate.goog", "path": "/"},
-            {"name": "CONSENT", "value": "YES+cb.20210720-07-p0.en+FX+417", "domain": ".google.com", "path": "/"},
-            {"name": "SOCS", "value": "CAISHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg", "domain": ".google.com", "path": "/"},
-        ])
-    except Exception as e:
-        logger.debug(f"Cookie reset notice: {e}")
-
-
-async def is_real_surge_screen(page: Page, page_html: str) -> bool:
-    """
-    Detects an actual Flipkart Akamai surge/queue screen without false-triggering
-    on Flipkart's embedded `statusCodesConfig` JSON inside valid 1MB product pages.
-    """
-    has_product_data = bool(re.search(r'"availabilityStatus"\s*:', page_html)) or (
-        "window.__INITIAL_STATE__" in page_html and len(page_html) > 50000
-    )
-    if has_product_data:
-        return False
-
-    body_text = ""
-    try:
-        body_text = (await page.inner_text("body")).lower()
-    except Exception:
-        body_text = page_html.lower()
-
-    if "looks like all of india is here" in body_text or "hang in there" in body_text:
-        return True
-
-    if len(page_html) < 25000 and ("looks like all of india is here" in page_html.lower() or "hang in there" in page_html.lower()):
-        return True
-
-    return False
-
-
 async def check_target_playwright(context: BrowserContext, target: Dict[str, Any]) -> Dict[str, Any]:
-    """Inspects Flipkart stock through Playwright-rendered Gateway."""
+    """Inspects Flipkart stock through Playwright headless browser."""
     target_id = target["id"]
     item_name = target["item_name"]
     direct_url = target["url"]
-    gateway_url = convert_to_gateway_url(direct_url, mobile=False)
 
     page: Optional[Page] = None
     try:
         page = await context.new_page()
 
-        # Abort heavy media, fonts, images, and analytics trackers to cut gateway request burst by ~80%
+        # Abort heavy media, fonts, images, and analytics trackers to save RAM & speed up checks
         blocked_domains = ("newrelic", "nr-data", "omtrdc", "demdex", "googletagmanager", "doubleclick", "youtube")
 
         async def block_media(route):
@@ -518,23 +469,12 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
 
         await page.route("**/*", block_media)
 
-        # Navigate via Playwright to the Gateway URL
+        # Navigate directly to Flipkart URL
         try:
-            await page.goto(gateway_url, timeout=30000, wait_until="domcontentloaded")
+            await page.goto(direct_url, timeout=30000, wait_until="domcontentloaded")
             await page.wait_for_timeout(2500)
         except Exception as e:
             logger.warning(f"Navigation notice for {item_name}: {e}")
-
-        # Check for Google consent screen and auto-click accept
-        for sel in ['button:has-text("Accept all")', 'button:has-text("I agree")', 'button[aria-label="Accept all"]', 'form[action*="consent"] button']:
-            btn = await page.query_selector(sel)
-            if btn:
-                try:
-                    await btn.click()
-                    await page.wait_for_timeout(2500)
-                    break
-                except Exception:
-                    pass
 
         page_html = await page.content()
         page_title = await page.title()
@@ -547,35 +487,20 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
         if m_price:
             price_val = f"₹{m_price.group(1)}"
 
-        # Extract Status with Multi-Layer Verification
-        status = "OUT_OF_STOCK"
-
-        # Layer 1: True Surge / Edge Queue Screen Check with Single Clean-Session Retry
-        is_surge = await is_real_surge_screen(page, page_html)
+        # Guard: check if Akamai rate-limit/surge page appeared (< 25KB and missing product JSON)
+        is_surge = len(page_html) < 25000 and not re.search(r'"availabilityStatus"\s*:', page_html)
         if is_surge:
-            logger.warning(f"Real Surge / Queue screen detected on {item_name}. Resetting session & retrying once...")
-            for attempt in range(1, 2):
-                try:
-                    await reset_gateway_cookies(context)
-                    await page.wait_for_timeout(3500)
-                    retry_url = convert_to_gateway_url(direct_url, mobile=True)
-                    await page.goto(retry_url, wait_until="domcontentloaded", timeout=25000)
-                    await page.wait_for_timeout(3000)
-                    page_html = await page.content()
-                    page_title = await page.title()
-
-                    if not await is_real_surge_screen(page, page_html):
-                        logger.info(f"   [{item_name}] Surge screen bypassed on recovery attempt #{attempt}!")
-                        is_surge = False
-                        m_price = re.search(r'"price":\s*(\d+)', page_html)
-                        if m_price:
-                            price_val = f"₹{m_price.group(1)}"
-                        break
-                except Exception as e:
-                    logger.debug(f"Surge recovery retry #{attempt} notice: {e}")
+            logger.warning(f"   [{item_name}] Temporary rate-limit / surge detected ({len(page_html)} bytes). Retrying once...")
+            try:
+                await page.wait_for_timeout(4000)
+                await page.goto(direct_url, timeout=25000, wait_until="domcontentloaded")
+                await page.wait_for_timeout(3000)
+                page_html = await page.content()
+                is_surge = len(page_html) < 25000 and not re.search(r'"availabilityStatus"\s*:', page_html)
+            except Exception as e:
+                logger.debug(f"Retry notice: {e}")
 
             if is_surge:
-                logger.warning(f"Surge screen persisted for {item_name} after recovery attempts.")
                 return {
                     "id": target_id,
                     "item_name": item_name,
@@ -583,17 +508,6 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
                     "price": price_val or target.get("denomination", ""),
                     "url": direct_url,
                 }
-
-        # Guard: if page is unexpectedly tiny without product state (e.g. gateway 429/timeout), report ERROR instead of guessing
-        if len(page_html) < 25000 and not re.search(r'"availabilityStatus"\s*:', page_html):
-            logger.warning(f"   [{item_name}] Unexpectedly small page ({len(page_html)} bytes), marking ERROR.")
-            return {
-                "id": target_id,
-                "item_name": item_name,
-                "status": "ERROR",
-                "price": price_val or target.get("denomination", ""),
-                "url": direct_url,
-            }
 
         # Layer 2: Explicit Out-of-Stock / Coming Soon Indicators
         has_coming_soon = bool(re.search(r'availabilityStatus":"COMING_SOON"', page_html, re.IGNORECASE))
@@ -733,8 +647,8 @@ async def run_monitor_cycle(
     context: Optional[BrowserContext],
     state: Dict[str, Any],
     is_first_cycle: bool = False,
-) -> bool:
-    """Executes a single check cycle across all Flipkart PlayStation targets. Returns True if surge circuit breaker tripped."""
+):
+    """Executes a single check cycle across all Flipkart PlayStation targets."""
     global TOTAL_CYCLES_COMPLETED
     TOTAL_CYCLES_COMPLETED += 1
 
@@ -746,8 +660,6 @@ async def run_monitor_cycle(
     logger.info("=" * 60)
 
     cycle_results: List[Dict[str, Any]] = []
-    consecutive_surges = 0
-    surge_tripped = False
     enabled_targets = [t for t in config.TARGET_SITES if t.get("enabled", True)]
 
     for idx, target in enumerate(enabled_targets):
@@ -761,11 +673,6 @@ async def run_monitor_cycle(
         current_status = result.get("status", "UNKNOWN")
         price = result.get("price", "")
         cycle_results.append(result)
-
-        if current_status == "SURGE_SCREEN":
-            consecutive_surges += 1
-        else:
-            consecutive_surges = 0
 
         previous_data = state.get(target_id, {})
         previous_status = previous_data.get("status")
@@ -818,29 +725,7 @@ async def run_monitor_cycle(
             }
             save_state(state)
 
-        # Surge Circuit Breaker: stop hammering gateway if 2 consecutive items return SURGE_SCREEN
-        if consecutive_surges >= 2:
-            surge_tripped = True
-            logger.warning("🚨 Surge Circuit Breaker tripped (2 consecutive SURGE_SCREEN). Pausing remaining checks to let Akamai cooldown reset.")
-            for rem_target in enabled_targets[idx + 1:]:
-                rem_id = rem_target["id"]
-                cycle_results.append({
-                    "id": rem_id,
-                    "item_name": rem_target["item_name"],
-                    "status": "SURGE_SCREEN",
-                    "price": rem_target.get("denomination", ""),
-                    "url": rem_target["url"],
-                })
-                LATEST_STOCK_STATE[rem_id] = {
-                    "item_name": rem_target["item_name"],
-                    "status": "SURGE_SCREEN",
-                    "last_price": rem_target.get("denomination", ""),
-                    "url": rem_target["url"],
-                    "last_checked": datetime.datetime.now().isoformat(),
-                }
-            break
-
-        # Gentle human-like jitter delay between items (e.g. 3.0s to 5.5s) to avoid Akamai rate spikes
+        # Gentle human-like jitter delay between items (e.g. 3.0s to 5.5s)
         jitter_delay = random.uniform(config.SITE_CHECK_DELAY_SECONDS, config.SITE_CHECK_DELAY_SECONDS + 2.5)
         await asyncio.sleep(jitter_delay)
 
@@ -858,7 +743,6 @@ async def run_monitor_cycle(
         await send_heartbeat_notification(TOTAL_CYCLES_COMPLETED)
 
     logger.info("✅ Cycle complete. Resting until next interval.")
-    return surge_tripped
 
 
 # ==========================================
@@ -884,7 +768,7 @@ async def main():
     playwright_instance = None
     browser = None
     context = None
-    engine_info = "Playwright Chromium (Gateway + Mumbai Geolocation)"
+    engine_info = "Playwright Chromium (Direct Flipkart / Indian Droplet)"
 
     try:
         playwright_instance = await async_playwright().start()
@@ -901,16 +785,13 @@ async def main():
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 720},
-            geolocation={"latitude": 19.0760, "longitude": 72.8777}, # Mumbai coordinates
+            geolocation={"latitude": 12.9716, "longitude": 77.5946}, # Bangalore coordinates
             permissions=["geolocation"],
             locale="en-IN",
             timezone_id="Asia/Kolkata",
         )
         await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); window.chrome = {runtime: {}};")
-
-        # Inject Google consent cookies for both domains so Google never 429s or blocks
-        await reset_gateway_cookies(context)
-        logger.info("Playwright Headless Chromium successfully initialized with Mumbai geo & gateway cookies.")
+        logger.info("Playwright Headless Chromium successfully initialized with Bangalore geolocation.")
 
     except Exception as e:
         logger.error(f"Failed to start Playwright browser: {e}")
@@ -923,24 +804,14 @@ async def main():
     is_first = True
     try:
         while True:
-            surge_tripped = False
             try:
-                if context and TOTAL_CYCLES_COMPLETED > 0 and TOTAL_CYCLES_COMPLETED % 30 == 0:
-                    logger.info("Refreshing browser cookies proactively to prevent Akamai session flagging...")
-                    await reset_gateway_cookies(context)
-                surge_tripped = await run_monitor_cycle(browser, context, state, is_first_cycle=is_first)
+                await run_monitor_cycle(browser, context, state, is_first_cycle=is_first)
                 is_first = False
             except Exception as e:
                 logger.error(f"Unexpected error during monitor cycle #{TOTAL_CYCLES_COMPLETED}: {e}", exc_info=True)
 
-            if surge_tripped:
-                if context:
-                    await reset_gateway_cookies(context)
-                cycle_sleep = config.SURGE_COOLDOWN_SECONDS + random.uniform(0.0, 30.0)
-                logger.warning(f"⏳ Surge cooldown active: sleeping {int(cycle_sleep)}s before next sweep...")
-            else:
-                cycle_sleep = max(60.0, config.CHECK_INTERVAL_SECONDS + random.uniform(-5.0, 5.0))
-                logger.info(f"Sleeping for {int(cycle_sleep)}s before next sweep...\n")
+            cycle_sleep = max(60.0, config.CHECK_INTERVAL_SECONDS + random.uniform(-4.0, 4.0))
+            logger.info(f"Sleeping for {int(cycle_sleep)}s before next sweep...\n")
             await asyncio.sleep(cycle_sleep)
 
     except (KeyboardInterrupt, asyncio.CancelledError):

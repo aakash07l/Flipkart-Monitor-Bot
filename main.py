@@ -628,22 +628,42 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
                 )
                 if cart_clickable:
                     await cart_clickable.click(timeout=2500)
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(2500)
                     post_html = await page.content()
+                    post_html_lower = post_html.lower()
 
-                    if any(err in post_html.lower() for err in ["currently out of stock", "not deliverable", "cannot be delivered", "item unavailable", "sold out"]):
-                        logger.warning(f"   [{item_name}] Cart click failed with unserviceable/out-of-stock response.")
+                    # Check for explicit cart failure banners (e.g. "Add to Cart Failed", "Failed to fetch", out of stock)
+                    has_cart_failure = any(
+                        err in post_html_lower
+                        for err in [
+                            "failed",
+                            "add to cart failed",
+                            "failed to fetch",
+                            "currently out of stock",
+                            "not deliverable",
+                            "cannot be delivered",
+                            "item unavailable",
+                            "sold out",
+                        ]
+                    )
+
+                    has_cart_success = (
+                        "go to cart" in post_html_lower or
+                        "viewcart" in page.url.lower() or
+                        "added to cart" in post_html_lower
+                    )
+
+                    if has_cart_failure or not has_cart_success:
+                        logger.warning(f"   [{item_name}] Cart verification failed or unconfirmed (No actual inventory). Marked OUT_OF_STOCK.")
                         status = "OUT_OF_STOCK"
-                    elif "GO TO CART" in post_html.upper() or "/viewcart" in page.url or "ADDED TO CART" in post_html.upper():
+                    else:
                         logger.info(f"   [{item_name}] Cart click SUCCEEDED! Verified genuine in-stock item.")
                         status = "IN_STOCK"
-                    else:
-                        status = "IN_STOCK"
                 else:
-                    status = "IN_STOCK"
+                    status = "OUT_OF_STOCK"
             except Exception as e:
                 logger.debug(f"Cart verification notice: {e}")
-                status = "IN_STOCK"
+                status = "OUT_OF_STOCK"
         else:
             status = "OUT_OF_STOCK"
 

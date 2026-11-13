@@ -454,6 +454,59 @@ def convert_to_gateway_url(flipkart_url: str) -> str:
     return f"{clean_url}{sep}_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en"
 
 
+async def warmup_gateway_session(context: BrowserContext) -> bool:
+    """
+    Navigates to Google Translate gateway once to accept consent and establish a live session.
+    Must be called once at startup before any product checks.
+    Returns True if session was established successfully.
+    """
+    warmup_url = convert_to_gateway_url("https://www.flipkart.com/")
+    logger.info(f"Warming up Google Translate gateway session...")
+    page = None
+    try:
+        page = await context.new_page()
+        await page.goto(warmup_url, timeout=35000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+
+        # Click any Google consent/accept button if present
+        for sel in [
+            'button:has-text("Accept all")',
+            'button:has-text("I agree")',
+            'button:has-text("Agree")',
+            'button[aria-label="Accept all"]',
+            'form[action*="consent"] button',
+        ]:
+            btn = await page.query_selector(sel)
+            if btn:
+                try:
+                    await btn.click()
+                    await page.wait_for_timeout(3000)
+                    logger.info("Gateway consent button clicked successfully.")
+                    break
+                except Exception:
+                    pass
+
+        # Wait for full page load after consent
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+
+        html = await page.content()
+        size = len(html)
+        logger.info(f"Gateway warmup complete. Page size: {size} bytes.")
+        return size > 50000  # Success = got a real Flipkart page (>50KB)
+    except Exception as e:
+        logger.warning(f"Gateway warmup notice: {e}")
+        return False
+    finally:
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+
 async def check_target_playwright(context: BrowserContext, target: Dict[str, Any]) -> Dict[str, Any]:
     """Inspects Flipkart stock through Playwright-rendered Gateway."""
     target_id = target["id"]
@@ -478,30 +531,18 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
         await page.route("**/*", block_media)
 
         # Navigate via Playwright to the Gateway URL
-        # Use networkidle so JS fully executes and __INITIAL_STATE__ is injected into DOM
+        # networkidle ensures JS executes fully and __INITIAL_STATE__ is injected into DOM
         try:
             await page.goto(gateway_url, timeout=35000, wait_until="networkidle")
         except Exception as e:
-            # networkidle may timeout on slow pages — fall back gracefully
             logger.warning(f"Navigation notice for {item_name}: {e}")
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=10000)
             except Exception:
                 pass
 
-        # Extra wait for JS-rendered __INITIAL_STATE__ to appear in DOM
-        await page.wait_for_timeout(3000)
-
-        # Check for Google consent screen and auto-click accept
-        for sel in ['button:has-text("Accept all")', 'button:has-text("I agree")', 'button[aria-label="Accept all"]', 'form[action*="consent"] button']:
-            btn = await page.query_selector(sel)
-            if btn:
-                try:
-                    await btn.click()
-                    await page.wait_for_timeout(3000)
-                    break
-                except Exception:
-                    pass
+        # Extra wait for JS-rendered __INITIAL_STATE__
+        await page.wait_for_timeout(2000)
 
         page_html = await page.content()
         page_title = await page.title()
@@ -848,6 +889,14 @@ async def main():
             {"name": "SOCS", "value": "CAISHAgBEhJnd3NfMjAyNDA4MjAtMF9SQzIaAmVuIAEaBgiA_L20Bg", "domain": ".google.com", "path": "/"},
         ])
         logger.info("Playwright Headless Chromium successfully initialized with Bangalore geolocation & Gateway.")
+
+        # Warm up gateway session: navigate to Flipkart homepage via gateway once to accept consent
+        session_ok = await warmup_gateway_session(context)
+        if session_ok:
+            logger.info("✅ Gateway session warmup succeeded — full product pages will load correctly.")
+            engine_info = "Playwright Chromium (Gateway Mode / Indian Droplet)"
+        else:
+            logger.warning("⚠️ Gateway session warmup page was small — consent may not have been accepted. Proceeding anyway.")
 
     except Exception as e:
         logger.error(f"Failed to start Playwright browser: {e}")

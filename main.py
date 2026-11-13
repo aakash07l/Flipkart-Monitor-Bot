@@ -531,7 +531,6 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
         await page.route("**/*", block_media)
 
         # Navigate via Playwright to the Gateway URL
-        # networkidle ensures JS executes fully and __INITIAL_STATE__ is injected into DOM
         try:
             await page.goto(gateway_url, timeout=35000, wait_until="networkidle")
         except Exception as e:
@@ -541,8 +540,17 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
             except Exception:
                 pass
 
-        # Extra wait for JS-rendered __INITIAL_STATE__
-        await page.wait_for_timeout(2000)
+        # Explicitly wait for Flipkart's __INITIAL_STATE__ JS object to be injected
+        # (block_media causes networkidle to fire early before JS finishes injecting state)
+        try:
+            await page.wait_for_function(
+                "() => !!(window.__INITIAL_STATE__ && typeof window.__INITIAL_STATE__ === 'object' && Object.keys(window.__INITIAL_STATE__).length > 2)",
+                timeout=18000
+            )
+            logger.debug(f"   [{item_name}] __INITIAL_STATE__ detected in DOM.")
+        except Exception:
+            # Fallback: just wait a bit longer
+            await page.wait_for_timeout(4000)
 
         page_html = await page.content()
         page_title = await page.title()

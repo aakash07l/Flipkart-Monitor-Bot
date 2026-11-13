@@ -520,6 +520,8 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
         has_coming_soon = bool(re.search(r'availabilityStatus":"COMING_SOON"', page_html, re.IGNORECASE))
         has_out_of_stock_schema = bool(re.search(r'schema\.org[\\/]+OutOfStock', page_html, re.IGNORECASE))
         has_notify_me = bool(re.search(r'productActionButtonType":"NOTIFY_ME', page_html, re.IGNORECASE))
+        # Check if item is unserviceable / out of stock in JSON state (e.g. "serviceable":false)
+        is_unserviceable = bool(re.search(r'"serviceable"\s*:\s*false', page_html, re.IGNORECASE))
         has_out_of_stock_text = any(
             phrase in page_html.lower()
             for phrase in [
@@ -530,9 +532,10 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
             ]
         )
 
-        if has_coming_soon or has_out_of_stock_schema or has_notify_me or has_out_of_stock_text:
+        if has_coming_soon or has_out_of_stock_schema or has_notify_me or has_out_of_stock_text or is_unserviceable:
             status = "OUT_OF_STOCK"
-            logger.info(f"   [{item_name}] Decided OUT_OF_STOCK via explicit stock markers.")
+            reason = "unserviceable in region" if is_unserviceable else "explicit stock markers"
+            logger.info(f"   [{item_name}] Decided OUT_OF_STOCK via {reason}.")
             return {
                 "id": target_id,
                 "item_name": item_name,

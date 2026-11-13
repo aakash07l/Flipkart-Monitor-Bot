@@ -495,16 +495,17 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
             price_val = f"₹{m_price.group(1)}"
 
         # Strict Unserviceability / Out-of-Stock Pre-Check
-        # Flipkart often sets availabilityStatus: IN_STOCK while serviceable: false or Item not serviceable
+        # Flipkart sets availabilityStatus: IN_STOCK while unserviceabilityReason: "NO_PINCODE" or serviceable: false
+        page_html_lower = page_html.lower()
         is_unserviceable = (
+            "no_pincode" in page_html_lower or
+            "unserviceabilityreason" in page_html_lower or
             '"serviceable":false' in page_html or
             '"serviceable": false' in page_html or
-            '"isServiceable":false' in page_html or
-            '"isServiceable": false' in page_html or
-            "item not serviceable" in page_html.lower() or
-            "not deliverable" in page_html.lower() or
-            "cannot be delivered" in page_html.lower() or
-            "no_pincode" in page_html.lower()
+            '"isserviceable":false' in page_html_lower or
+            "item not serviceable" in page_html_lower or
+            "not deliverable" in page_html_lower or
+            "cannot be delivered" in page_html_lower
         )
         if is_unserviceable:
             logger.info(f"   [{item_name}] Decided OUT_OF_STOCK (Item marked unserviceable / non-deliverable).")

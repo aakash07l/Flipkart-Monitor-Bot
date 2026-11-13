@@ -494,6 +494,28 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
         if m_price:
             price_val = f"₹{m_price.group(1)}"
 
+        # Strict Unserviceability / Out-of-Stock Pre-Check
+        # Flipkart often sets availabilityStatus: IN_STOCK while serviceable: false or Item not serviceable
+        is_unserviceable = (
+            '"serviceable":false' in page_html or
+            '"serviceable": false' in page_html or
+            '"isServiceable":false' in page_html or
+            '"isServiceable": false' in page_html or
+            "item not serviceable" in page_html.lower() or
+            "not deliverable" in page_html.lower() or
+            "cannot be delivered" in page_html.lower() or
+            "no_pincode" in page_html.lower()
+        )
+        if is_unserviceable:
+            logger.info(f"   [{item_name}] Decided OUT_OF_STOCK (Item marked unserviceable / non-deliverable).")
+            return {
+                "id": target_id,
+                "item_name": item_name,
+                "status": "OUT_OF_STOCK",
+                "price": price_val or target.get("denomination", ""),
+                "url": direct_url,
+            }
+
         # Guard: check if rate-limit/surge page appeared (< 25KB and missing product JSON)
         is_surge = len(page_html) < 25000 and not re.search(r'"availabilityStatus"\s*:', page_html)
         if is_surge:

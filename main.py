@@ -478,11 +478,19 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
         await page.route("**/*", block_media)
 
         # Navigate via Playwright to the Gateway URL
+        # Use networkidle so JS fully executes and __INITIAL_STATE__ is injected into DOM
         try:
-            await page.goto(gateway_url, timeout=30000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(2500)
+            await page.goto(gateway_url, timeout=35000, wait_until="networkidle")
         except Exception as e:
+            # networkidle may timeout on slow pages — fall back gracefully
             logger.warning(f"Navigation notice for {item_name}: {e}")
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+
+        # Extra wait for JS-rendered __INITIAL_STATE__ to appear in DOM
+        await page.wait_for_timeout(3000)
 
         # Check for Google consent screen and auto-click accept
         for sel in ['button:has-text("Accept all")', 'button:has-text("I agree")', 'button[aria-label="Accept all"]', 'form[action*="consent"] button']:
@@ -490,7 +498,7 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
             if btn:
                 try:
                     await btn.click()
-                    await page.wait_for_timeout(2500)
+                    await page.wait_for_timeout(3000)
                     break
                 except Exception:
                     pass
@@ -506,16 +514,26 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
         if m_price:
             price_val = f"₹{m_price.group(1)}"
 
-        # Guard: check if Akamai rate-limit/surge page appeared (< 25KB and missing product JSON)
-        is_surge = len(page_html) < 25000 and not re.search(r'"availabilityStatus"\s*:', page_html)
+        # Surge Detection: ONLY flag as surge if page explicitly shows surge text
+        # (never trigger on page-size alone — Playwright may get partial pages on slow loads)
+        page_lower = page_html.lower()
+        is_surge = (
+            "looks like all of india is here" in page_lower or
+            "hang in there, the offers are worth the wait" in page_lower
+        ) and not re.search(r'"availabilityStatus"\s*:', page_html)
+
         if is_surge:
-            logger.warning(f"   [{item_name}] Rate-limit / surge detected ({len(page_html)} bytes). Retrying once...")
+            logger.warning(f"   [{item_name}] Surge/Queue screen confirmed ({len(page_html)} bytes). Retrying once after wait...")
             try:
-                await page.wait_for_timeout(4000)
-                await page.goto(gateway_url, timeout=25000, wait_until="domcontentloaded")
+                await page.wait_for_timeout(5000)
+                await page.goto(gateway_url, timeout=35000, wait_until="networkidle")
                 await page.wait_for_timeout(3000)
                 page_html = await page.content()
-                is_surge = len(page_html) < 25000 and not re.search(r'"availabilityStatus"\s*:', page_html)
+                page_lower = page_html.lower()
+                is_surge = (
+                    "looks like all of india is here" in page_lower or
+                    "hang in there, the offers are worth the wait" in page_lower
+                ) and not re.search(r'"availabilityStatus"\s*:', page_html)
             except Exception as e:
                 logger.debug(f"Retry notice: {e}")
 
@@ -527,6 +545,17 @@ async def check_target_playwright(context: BrowserContext, target: Dict[str, Any
                     "price": price_val or target.get("denomination", ""),
                     "url": direct_url,
                 }
+
+        # Guard: if page is very small and has no product data at all, mark ERROR
+        if len(page_html) < 10000 and not re.search(r'"availabilityStatus"\s*:', page_html):
+            logger.warning(f"   [{item_name}] Page too small and no product data ({len(page_html)} bytes), marking ERROR.")
+            return {
+                "id": target_id,
+                "item_name": item_name,
+                "status": "ERROR",
+                "price": price_val or target.get("denomination", ""),
+                "url": direct_url,
+            }
 
         # Layer 2: Explicit Out-of-Stock / Coming Soon Indicators
         has_coming_soon = bool(re.search(r'availabilityStatus":"COMING_SOON"', page_html, re.IGNORECASE))

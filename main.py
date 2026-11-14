@@ -853,15 +853,67 @@ async def main():
     # 4. Dispatch Startup Notification to Telegram
     await send_startup_notification(engine_info=engine_info)
 
-    # 5. Continuous Loop
+    async def init_browser_session():
+        nonlocal playwright_instance, browser, context
+        if context:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if not playwright_instance:
+            playwright_instance = await async_playwright().start()
+        
+        browser = await playwright_instance.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720},
+            geolocation={"latitude": 12.9716, "longitude": 77.5946},
+            permissions=["geolocation"],
+            locale="en-IN",
+            timezone_id="Asia/Kolkata",
+        )
+        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); window.chrome = {runtime: {}};")
+        logger.info("Chromium browser session initialized/refreshed successfully.")
+
+    # 5. Continuous Loop with Auto-Healing & Proactive Memory Refresh
     is_first = True
     try:
         while True:
+            # Proactively refresh browser every 80 cycles (~2 hours) to avoid memory leaks
+            if TOTAL_CYCLES_COMPLETED > 0 and TOTAL_CYCLES_COMPLETED % 80 == 0:
+                logger.info(f"🔄 Proactive memory refresh (Cycle #{TOTAL_CYCLES_COMPLETED}): re-initializing browser...")
+                try:
+                    await init_browser_session()
+                except Exception as e:
+                    logger.error(f"Error during proactive browser refresh: {e}")
+
             try:
                 await run_monitor_cycle(browser, context, state, is_first_cycle=is_first)
                 is_first = False
             except Exception as e:
                 logger.error(f"Unexpected error during monitor cycle #{TOTAL_CYCLES_COMPLETED}: {e}", exc_info=True)
+                # Auto-Heal: if browser/context crashed, resurrect it immediately!
+                if "closed" in str(e).lower() or "crash" in str(e).lower() or not context:
+                    logger.warning("🚨 Browser crash/close detected! Auto-healing: launching fresh browser session...")
+                    try:
+                        await init_browser_session()
+                        logger.info("✅ Browser successfully resurrected. Resuming checks.")
+                    except Exception as re_err:
+                        logger.error(f"Failed to auto-heal browser: {re_err}")
 
             cycle_sleep = max(60.0, config.CHECK_INTERVAL_SECONDS + random.uniform(-4.0, 4.0))
             logger.info(f"Sleeping for {int(cycle_sleep)}s before next sweep...\n")
